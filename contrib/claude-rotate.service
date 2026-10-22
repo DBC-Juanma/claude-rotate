@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate Claude Code logins across accounts on usage limits
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-rotate watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

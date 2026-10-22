@@ -1,0 +1,27 @@
+[project]
+name = "claude-rotate"
+version = "0.1.0"
+description = "Rotate the Claude Code login across several accounts when one hits its usage limit"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+claude-rotate = "claude_rotate:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["claude_rotate.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
