@@ -333,6 +333,33 @@ def test_reconnect_types_over_a_dim_suggestion(w, two):
     assert w.sent == RC_BUSY
 
 
+RC_DIALOG_SCREEN = ("● done\n───\n   Remote Control\n   This session is available in the Claude mobile app and claude.ai/code.\n"
+                    "     Disconnect this session\n     Show QR code   Scan with your phone to open this session\n"
+                    "   ❯ Continue\n   Enter to select · Esc to continue\n")
+
+
+def test_a_remote_control_dialog_left_open_is_closed_on_the_next_tick(w, two):
+    rc_session(w, two, "idle")
+    w.screen = RC_DIALOG_SCREEN
+    rot = cr.Rotator(w.ctx)
+    assert rot.dismiss_rc_dialogs(two) == []
+    assert w.sent == []
+    assert rot.dismiss_rc_dialogs(two) == ["%1"]
+    assert w.sent == [("%1", ("Escape",), False)]
+
+
+def test_a_dialog_closed_between_ticks_is_not_escaped(w, two):
+    rc_session(w, two, "idle")
+    w.screen = RC_DIALOG_SCREEN
+    rot = cr.Rotator(w.ctx)
+    rot.dismiss_rc_dialogs(two)
+    w.screen = "● done\n───\n❯ \n───\n  status line\n"
+    assert rot.dismiss_rc_dialogs(two) == []
+    w.screen = RC_DIALOG_SCREEN
+    assert rot.dismiss_rc_dialogs(two) == []
+    assert w.sent == []
+
+
 def test_reconnect_skips_an_open_dialog(w, two):
     rc_session(w, two, "busy")
     w.screen = "❯ earlier prompt\n   Remote Control\n   ❯ Continue\n   Enter to select · Esc to continue\n"

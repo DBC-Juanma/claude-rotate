@@ -37,6 +37,7 @@ PROMPT_FREE = ("idle", "shell")
 SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
+RC_DIALOG = ("This session is available in the Claude mobile app", "Esc to continue")
 RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
 SHELLS = ("bash", "zsh", "sh", "fish", "dash")
@@ -585,6 +586,7 @@ class Rotator:
         self.rc_sent: dict = {}
         self.rc_restarted: dict = {}
         self.auth_hits: dict = {}
+        self.rc_dialogs: set = set()
 
     def baseline(self, cd: str) -> None:
         """Skip everything already in the transcripts of cd."""
@@ -697,6 +699,32 @@ class Rotator:
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
         return sent
+
+    def dismiss_rc_dialogs(self, cd: str) -> list:
+        """Close the Remote Control dialog of a connected session when it is still open on the next tick.
+
+        /remote-control typed into a busy or already connected session opens that dialog and leaves the
+        session waiting on it when its turn ends; Escape is its own "continue". Returns the panes closed.
+        """
+        ctx, closed, seen = self.ctx, [], set()
+        if not rc_wanted(cd):
+            return closed
+        for p in ctx.list_procs():
+            if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in seen:
+                continue
+            if session_info(cd, p.pid).get("kind") != "interactive":
+                continue
+            lines = [ln.strip() for ln in plain(ctx.tmux_capture(p)).splitlines() if ln.strip()]
+            if not lines or not lines[-1].endswith(RC_DIALOG[1]) or not any(RC_DIALOG[0] in ln for ln in lines[-8:]):
+                continue
+            seen.add(p.pane)
+            if p.pane in self.rc_dialogs:
+                ctx.tmux_send(p, ["Escape"])
+                closed.append(p.pane)
+        self.rc_dialogs = seen - set(closed)
+        if closed:
+            ctx.log("rc_dialog_closed", config_dir=cd, panes=",".join(closed))
+        return closed
 
     def restart(self, cd: str, p: Proc, info: dict) -> None:
         """Exit an idle session whose /remote-control did not come up and resume it in the same pane, so it reloads its login."""
@@ -844,6 +872,7 @@ class Rotator:
             else:
                 self.recover(cd)
             self.wake(cd)
+            self.dismiss_rc_dialogs(cd)
             self.reconnect(cd)
         renew_due(self.ctx)
 
