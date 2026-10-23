@@ -58,8 +58,10 @@ class World:
         self.claude_runs = []
         self.claude_reply = (0, OK_RESULT)
         self.claude_writes = None
+        self.screen = "● done\n───\n❯ \n───\n  status line\n"
         self.ctx = cr.Ctx(root=tmp_path / "root", now=self.clock, sleep=lambda s: None,
-                          list_procs=lambda: self.procs, tmux_send=self._send, out=io.StringIO(),
+                          list_procs=lambda: self.procs, tmux_send=self._send, tmux_capture=lambda p: self.screen,
+                          out=io.StringIO(),
                           run_claude=self._run_claude, token_email=lambda at: self.owners.get(at))
 
     def _send(self, proc, keys, literal=False):
@@ -295,3 +297,43 @@ def test_limit_from_before_the_switch_is_ignored(w, two):
     assert cr.current_email(two) == "b@x"
     assert "b@x" not in cr.load_state(w.ctx)["limited"]
     assert "limit_inflight_ignored" in w.ctx.out.getvalue()
+
+
+RC_FREE = [("%1", ("Escape",), False), ("%1", (cr.RC_TEXT,), True), ("%1", ("Enter",), False), ("%1", ("Escape",), False)]
+RC_BUSY = [("%1", (cr.RC_TEXT,), True), ("%1", ("Enter",), False)]
+
+
+def rc_session(w, cd: str, status: str) -> None:
+    (Path(cd) / "settings.json").write_text(json.dumps({"remoteControlAtStartup": True}))
+    (Path(cd) / "sessions").mkdir()
+    (Path(cd) / "sessions" / "4242.json").write_text(json.dumps(
+        {"sessionId": "s1", "kind": "interactive", "status": status, "bridgeSessionId": None}))
+    w.procs = [cr.Proc(4242, cd, "%1", None)]
+
+
+@pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", RC_BUSY)])
+def test_reconnect_runs_remote_control_in_every_session_without_bridge(w, two, status, keys):
+    rc_session(w, two, status)
+    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert w.sent == keys
+
+
+@pytest.mark.parametrize("status", ["idle", "busy"])
+def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
+    rc_session(w, two, status)
+    w.screen = "● done\n───\n❯ lanza el benchmark ya\n───\n  status line\n"
+    assert cr.Rotator(w.ctx).reconnect(two) == []
+    assert w.sent == []
+
+
+def test_reconnect_types_over_a_dim_suggestion(w, two):
+    rc_session(w, two, "busy")
+    w.screen = "───\n\x1b[39m❯\xa0\x1b[2mlanza el benchmark ya\x1b[0m\n───\n"
+    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert w.sent == RC_BUSY
+
+
+def test_reconnect_skips_an_open_dialog(w, two):
+    rc_session(w, two, "busy")
+    w.screen = "❯ earlier prompt\n   Remote Control\n   ❯ Continue\n   Enter to select · Esc to continue\n"
+    assert cr.Rotator(w.ctx).reconnect(two) == []

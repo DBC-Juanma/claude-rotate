@@ -25,7 +25,7 @@ claude-rotate keeps a **vault** with one token slot per account and runs a watch
 4. **Files every token under its real owner.** When the live tokens change (a session refreshed them, or a session still on the old account wrote its token), it asks the OAuth profile endpoint who owns the token and stores it in that account's slot. If the token belongs to a different account than the one the config dir should be on, it puts the right tokens back. If the owner can't be resolved, for example because there's no network, it writes nothing. It never guesses.
 5. **Keeps idle accounts alive.** Every 6 hours, each enrolled account that isn't in use gets a one-word `claude -p` call. The call runs in a throwaway config dir, so the tokens refresh and get stored without touching your real one.
 6. **Comes back.** When every account is limited, it logs `all_limited` and waits. As soon as one is free again, it switches and wakes the sessions.
-7. **Optional: Remote Control.** If a config dir sets `"remoteControlAtStartup": true` in its `settings.json`, it re-runs `/remote-control` in idle sessions that lost their bridge. If the bridge still doesn't come up, it restarts the session in the same pane with `claude --resume`.
+7. **Optional: Remote Control.** If a config dir sets `"remoteControlAtStartup": true` in its `settings.json`, it re-runs `/remote-control` in sessions that lost their bridge as soon as their prompt is free (idle, or only running background shells). If the bridge still doesn't come up, it restarts the session in the same pane with `claude --resume`.
 
 ## Requirements
 

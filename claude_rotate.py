@@ -33,6 +33,9 @@ AUTH_RE = re.compile(r"please run /login|oauth token has expired|invalid authent
 WAKE_TEXT = "Account rotated (claude-rotate): continue where you stopped."
 RC_TEXT = "/remote-control"
 RC_RETRY = 30
+PROMPT_FREE = ("idle", "shell")
+SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
 RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
@@ -79,6 +82,11 @@ def real_tmux_send(proc: Proc, keys: list, literal: bool = False) -> None:
     _tmux(proc, "send-keys", "-t", proc.pane, *(["-l"] if literal else []), *keys)
 
 
+def real_tmux_capture(proc: Proc) -> str:
+    """Return the visible screen of the proc's tmux pane, with its SGR escape codes."""
+    return _tmux(proc, "capture-pane", "-p", "-e", "-t", proc.pane)
+
+
 def claude_env(config_dir: str) -> dict:
     """Return os.environ pointed at config_dir, without auth variables that would override its OAuth login."""
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")}
@@ -113,13 +121,14 @@ class Ctx:
 
     def __init__(self, root: Path = DEFAULT_ROOT, now: Callable = time.time, sleep: Callable = time.sleep,
                  list_procs: Callable = real_list_procs,
-                 tmux_send: Callable = real_tmux_send, out=None, run_claude: Callable = real_run_claude,
+                 tmux_send: Callable = real_tmux_send, tmux_capture: Callable = real_tmux_capture, out=None, run_claude: Callable = real_run_claude,
                  token_email: Callable = real_token_email, claude_login: Callable = real_claude_login):
         self.root = Path(root)
         self.now = now
         self.sleep = sleep
         self.list_procs = list_procs
         self.tmux_send = tmux_send
+        self.tmux_capture = tmux_capture
         self.run_claude = run_claude
         self.token_email = token_email
         self.claude_login = claude_login
@@ -532,6 +541,17 @@ def rc_wanted(cd: str) -> bool:
     return bool((read_json(Path(cd) / "settings.json", {}) or {}).get("remoteControlAtStartup"))
 
 
+def plain(screen: str) -> str:
+    """screen without SGR escape codes."""
+    return SGR_RE.sub("", screen)
+
+
+def prompt_empty(screen: str) -> bool:
+    """Whether the input box on a captured Claude Code screen (its last ❯ line) holds no typed text; dim suggestions don't count."""
+    prompts = [plain(DIM_RE.sub("", ln)).replace("\xa0", " ").strip() for ln in screen.splitlines() if plain(ln).strip().startswith("❯")]
+    return bool(prompts) and prompts[-1] == "❯"
+
+
 def is_idle(line: Optional[str]) -> bool:
     """True when a session's last turn entry is a finished assistant reply or Claude Code's own error."""
     try:
@@ -634,15 +654,19 @@ class Rotator:
         return woken
 
     def reconnect(self, cd: str) -> list:
-        """Run /remote-control in each idle interactive tmux session of cd that has no Remote Control bridge."""
-        ctx, sent = self.ctx, []
+        """Run /remote-control in each interactive tmux session of cd that has no Remote Control bridge and an empty input box.
+
+        Busy sessions get it typed without Escape, which would interrupt the running turn; it takes effect immediately.
+        """
+        ctx, sent, escape = self.ctx, [], set()
         if not rc_wanted(cd):
             return sent
         for p in ctx.list_procs():
             if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in sent:
                 continue
             info = session_info(cd, p.pid)
-            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or info.get("status") != "idle":
+            status = info.get("status")
+            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or status not in PROMPT_FREE + ("busy",):
                 continue
             last = self.rc_sent.get(p.pid)
             if last and ctx.now() - last < RC_RETRY:
@@ -651,11 +675,17 @@ class Rotator:
             line = last_turn_entry(path) if path else None
             if line and entry_limit(line):
                 continue
-            if last and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
-                    and any(m in _tmux(p, "capture-pane", "-p", "-t", p.pane) for m in RC_BROKEN):
+            screen = ctx.tmux_capture(p)
+            if not prompt_empty(screen):
+                continue
+            free = status in PROMPT_FREE
+            if free and last and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
+                    and any(m in plain(screen) for m in RC_BROKEN):
                 self.restart(cd, p, info)
                 continue
-            ctx.tmux_send(p, ["Escape"])
+            if free:
+                ctx.tmux_send(p, ["Escape"])
+                escape.add(p.pane)
             ctx.tmux_send(p, [RC_TEXT], literal=True)
             ctx.tmux_send(p, ["Enter"])
             self.rc_sent[p.pid] = ctx.now()
@@ -663,7 +693,7 @@ class Rotator:
         if sent:
             ctx.sleep(5)
             for p in ctx.list_procs():
-                if p.pane in sent:
+                if p.pane in escape:
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
         return sent
