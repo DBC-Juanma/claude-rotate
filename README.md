@@ -47,16 +47,17 @@ From a clone: `uv tool install .`
 
 ## Quick start
 
-**1. Enroll each account.** Log in from a fresh, temporary config dir and snapshot it:
+**1. Add each account.**
 
 ```bash
-tmp=$(mktemp -d)
-CLAUDE_CONFIG_DIR=$tmp claude          # run /login with the account, then /exit
-claude-rotate enroll --config-dir "$tmp"
-rm -rf "$tmp"
+claude-rotate login
 ```
 
-Repeat this for every account. The account you are already logged into in `~/.claude` can be enrolled directly with `claude-rotate enroll`. Rotation follows the order you enroll accounts in.
+It opens the browser login. Sign in with the account and it's enrolled. `enroll` checks with the OAuth profile endpoint that the token really belongs to that account, and refuses otherwise. Repeat for every account. The account you are already logged into in `~/.claude` can be enrolled directly with `claude-rotate enroll`. Rotation follows the order you add accounts in.
+
+**From inside Claude Code**, in a config dir claude-rotate watches (`~/.claude` by default): run `/login` with the account, then `! claude-rotate enroll`. The session switches to that account, which is the same state a rotation leaves it in.
+
+Don't enroll from a config dir that claude-rotate doesn't watch while sessions run in it. The watcher treats that account as idle and renews it in its own throwaway dir, which rotates the refresh token and logs those sessions out.
 
 **2. Check them.**
 
@@ -77,12 +78,23 @@ journalctl --user -u claude-rotate -f
 
 The unit runs `~/.local/bin/claude-rotate watch`, which is where `uv tool install` and pipx put the command by default. If yours is somewhere else, edit `ExecStart`.
 
-**4. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `woke`, and the panes continue on their own.
+**4. Optional: Remote Control in every session.** Add this to the config dir's `settings.json` (`~/.claude/settings.json`):
+
+```json
+{
+  "remoteControlAtStartup": true
+}
+```
+
+Every new session starts with Remote Control on. After a rotation, claude-rotate re-runs `/remote-control` in idle sessions that lost their bridge, and restarts with `claude --resume` any session whose bridge still doesn't come up.
+
+**5. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `woke`, and the panes continue on their own.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
+| `claude-rotate login [--email EMAIL]` | Log in to a new account in a throwaway config dir and enroll it |
 | `claude-rotate enroll [--config-dir DIR]` | Snapshot the account logged in to `DIR` (default `$CLAUDE_CONFIG_DIR` or `~/.claude`) into the vault |
 | `claude-rotate status` | Account per watched config dir; for every account: available / limited until / dead, and token expiry |
 | `claude-rotate check` | Renew every idle account now |

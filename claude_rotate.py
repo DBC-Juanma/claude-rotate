@@ -79,13 +79,23 @@ def real_tmux_send(proc: Proc, keys: list, literal: bool = False) -> None:
     _tmux(proc, "send-keys", "-t", proc.pane, *(["-l"] if literal else []), *keys)
 
 
-def real_run_claude(config_dir: str) -> tuple:
-    """Run a one-word prompt with claude in an isolated config dir; return (returncode, stdout). Raises on timeout."""
+def claude_env(config_dir: str) -> dict:
+    """Return os.environ pointed at config_dir, without auth variables that would override its OAuth login."""
     env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")}
     env["CLAUDE_CONFIG_DIR"] = config_dir
-    r = subprocess.run(["claude", "-p", "Reply with the single word ok", "--output-format", "json"], env=env,
+    return env
+
+
+def real_run_claude(config_dir: str) -> tuple:
+    """Run a one-word prompt with claude in an isolated config dir; return (returncode, stdout). Raises on timeout."""
+    r = subprocess.run(["claude", "-p", "Reply with the single word ok", "--output-format", "json"], env=claude_env(config_dir),
                        capture_output=True, text=True, timeout=RENEW_TIMEOUT, cwd=config_dir)
     return r.returncode, r.stdout + ("\n" + r.stderr if r.returncode else "")
+
+
+def real_claude_login(config_dir: str, email: Optional[str]) -> None:
+    """Run the interactive `claude auth login` against config_dir. Raises if it fails."""
+    subprocess.run(["claude", "auth", "login"] + (["--email", email] if email else []), env=claude_env(config_dir), check=True)
 
 
 def real_token_email(access_token: str) -> Optional[str]:
@@ -104,7 +114,7 @@ class Ctx:
     def __init__(self, root: Path = DEFAULT_ROOT, now: Callable = time.time, sleep: Callable = time.sleep,
                  list_procs: Callable = real_list_procs,
                  tmux_send: Callable = real_tmux_send, out=None, run_claude: Callable = real_run_claude,
-                 token_email: Callable = real_token_email):
+                 token_email: Callable = real_token_email, claude_login: Callable = real_claude_login):
         self.root = Path(root)
         self.now = now
         self.sleep = sleep
@@ -112,6 +122,7 @@ class Ctx:
         self.tmux_send = tmux_send
         self.run_claude = run_claude
         self.token_email = token_email
+        self.claude_login = claude_login
         self.out = out or sys.stdout
         self._depth = 0
         self._fh = None
@@ -262,12 +273,15 @@ def current_email(cd: str) -> Optional[str]:
 
 
 def enroll(ctx: Ctx, cd: str) -> str:
-    """Snapshot the account logged in cd into the vault; return its email."""
+    """Snapshot the account logged in cd into the vault after checking the token's owner; return its email."""
     with ctx.lock():
         acc, oauth = live_account(cd), live_oauth(cd)
         if not acc or not acc.get("emailAddress") or not oauth:
             raise SystemExit(f"no logged-in account found in {cd}")
         email = acc["emailAddress"]
+        owner = ctx.token_email(oauth["accessToken"])
+        if owner != email:
+            raise SystemExit(f"the token in {cd} belongs to {owner or 'an account that could not be resolved'}, not {email}")
         save_slot(ctx, {"email": email, "claudeAiOauth": oauth, "oauthAccount": acc})
         cfg = load_config(ctx)
         if email not in cfg["order"]:
@@ -278,6 +292,15 @@ def enroll(ctx: Ctx, cd: str) -> str:
             save_state(ctx, st)
         ctx.log("enroll", email=email, config_dir=cd)
         return email
+
+
+def login(ctx: Ctx, email: Optional[str] = None) -> str:
+    """Log in to a new account in a throwaway config dir, enroll it and delete the dir; return its email."""
+    with tempfile.TemporaryDirectory(prefix="claude-rotate-login-") as tmp:
+        ctx.claude_login(tmp, email)
+        got = enroll(ctx, tmp)
+    print(f"enrolled {got}", file=ctx.out)
+    return got
 
 
 def switch(ctx: Ctx, cd: str, target: str, reason: str = "use") -> None:
@@ -832,6 +855,8 @@ def default_dir() -> str:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="claude-rotate")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("login")
+    p.add_argument("--email", default=None)
     p = sub.add_parser("enroll")
     p.add_argument("--config-dir", default=None)
     sub.add_parser("status")
@@ -843,7 +868,9 @@ def main(argv=None) -> None:
     p.add_argument("--interval", type=float, default=15)
     a = ap.parse_args(argv)
     ctx = Ctx()
-    if a.cmd == "enroll":
+    if a.cmd == "login":
+        login(ctx, a.email)
+    elif a.cmd == "enroll":
         enroll(ctx, os.path.normpath(a.config_dir or default_dir()))
     elif a.cmd == "status":
         status(ctx)

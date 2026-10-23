@@ -88,6 +88,7 @@ def two(w):
     """Accounts a@x and b@x enrolled from their own dirs; cd_a is the watched dir, logged in as a@x."""
     cd_a = make_cd(w.tmp, "a", "a@x", oauth("a1"))
     cd_b = make_cd(w.tmp, "b", "b@x", oauth("b1"))
+    w.owners.update({"at-a1": "a@x", "at-b1": "b@x"})
     cr.enroll(w.ctx, cd_a)
     cr.enroll(w.ctx, cd_b)
     cfg = cr.load_config(w.ctx)
@@ -137,6 +138,46 @@ def test_enroll_adds_vault_slot_and_order(w, two):
     assert cr.load_slot(w.ctx, "a@x")["oauthAccount"] == account("a@x")
 
 
+def test_login_enrolls_account_from_throwaway_dir_and_removes_it(w, two):
+    seen = []
+
+    def fake_login(cd, email):
+        seen.append((cd, email))
+        Path(cd, ".credentials.json").write_text(json.dumps({"claudeAiOauth": oauth("c1")}))
+        Path(cd, ".claude.json").write_text(json.dumps({"oauthAccount": account("c@x")}))
+
+    w.ctx.claude_login = fake_login
+    w.owners["at-c1"] = "c@x"
+    assert cr.login(w.ctx, "c@x") == "c@x"
+    assert seen[0][1] == "c@x"
+    assert not Path(seen[0][0]).exists()
+    assert w.slot_tokens("c@x") == oauth("c1")
+    assert cr.load_config(w.ctx)["order"] == ["a@x", "b@x", "c@x"]
+
+
+def test_login_aborted_enrolls_nothing(w, two):
+    w.ctx.claude_login = lambda cd, email: None
+    with pytest.raises(SystemExit):
+        cr.login(w.ctx)
+    assert cr.load_config(w.ctx)["order"] == ["a@x", "b@x"]
+
+
+def test_enroll_refuses_token_of_another_account(w, two):
+    cd = make_cd(w.tmp, "c", "c@x", oauth("a9"))
+    w.owners["at-a9"] = "a@x"
+    with pytest.raises(SystemExit):
+        cr.enroll(w.ctx, cd)
+    assert cr.load_slot(w.ctx, "c@x") is None
+    assert cr.load_config(w.ctx)["order"] == ["a@x", "b@x"]
+
+
+def test_enroll_refuses_unresolved_owner(w, two):
+    cd = make_cd(w.tmp, "c", "c@x", oauth("c1"))
+    with pytest.raises(SystemExit):
+        cr.enroll(w.ctx, cd)
+    assert cr.load_slot(w.ctx, "c@x") is None
+
+
 def test_switch_saves_outgoing_tokens_and_keeps_other_keys(w, two):
     cr.write_live_oauth(two, oauth("a2"))
     cr.switch(w.ctx, two, "b@x")
@@ -155,6 +196,7 @@ def test_switch_refuses_dead_account(w, two):
 
 def test_next_available_skips_limited_and_dead(w, two):
     make_cd(w.tmp, "c", "c@x", oauth("c1"))
+    w.owners["at-c1"] = "c@x"
     cr.enroll(w.ctx, str(w.tmp / "c"))
     st = cr.load_state(w.ctx)
     st["limited"]["b@x"] = NOW + 3600
