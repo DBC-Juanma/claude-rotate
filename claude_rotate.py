@@ -30,7 +30,9 @@ RENEW_TIMEOUT = 180
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 DEAD_RE = re.compile(r"expired|could not be refreshed|not logged in|please run /login|invalid.{0,20}(token|grant)|unauthorized|authentication", re.I)
 AUTH_RE = re.compile(r"please run /login|oauth token has expired|invalid authentication credentials|authentication_error|not logged in|invalid api key", re.I)
-WAKE_TEXT = "Account rotated (claude-rotate): continue where you stopped."
+WAKE_TEXT = ("Account rotated (claude-rotate). Before anything else, write a short status summary for whoever follows "
+             "this session remotely: what you were doing, what is done, what is pending and the next step. "
+             "Then continue where you stopped.")
 RC_TEXT = "/remote-control"
 RC_RETRY = 30
 PROMPT_FREE = ("idle", "shell")
@@ -565,6 +567,16 @@ def is_idle(line: Optional[str]) -> bool:
     return bool(e.get("isApiErrorMessage")) or msg.get("stop_reason") in IDLE_STOPS
 
 
+def rc_command(info: dict) -> str:
+    """The /remote-control command for a session, carrying its name so the remote session keeps it."""
+    return f"{RC_TEXT} {info['name']}" if info.get("name") else RC_TEXT
+
+
+def rc_missing(cd: str, info: dict) -> bool:
+    """Whether an interactive session of cd should run Remote Control and has no bridge."""
+    return rc_wanted(cd) and info.get("kind") == "interactive" and not info.get("bridgeSessionId")
+
+
 def session_transcript(cd: str, pid: int) -> Optional[str]:
     """The transcript of the session a claude process is running, from <cd>/sessions/<pid>.json."""
     sid = session_info(cd, pid).get("sessionId")
@@ -632,7 +644,11 @@ class Rotator:
         return hits
 
     def wake(self, cd: str) -> list:
-        """Nudge each tmux session of cd whose last turn is a limit error from before the last switch."""
+        """Nudge each tmux session of cd whose last turn is a limit error from before the last switch.
+
+        A session that should run Remote Control and has lost its bridge gets /remote-control <name> first, so the
+        status summary the nudge asks for is the first thing the new remote session shows.
+        """
         ctx, woken = self.ctx, []
         st = load_state(ctx)
         cur = current_email(cd)
@@ -646,6 +662,13 @@ class Rotator:
             hit = (entry_limit(line) or entry_limit(line, AUTH_RE)) if line else None
             if not hit or (hit.uuid or path) in self.woken:
                 continue
+            info = session_info(cd, p.pid)
+            if rc_missing(cd, info):
+                ctx.tmux_send(p, ["Escape"])
+                ctx.tmux_send(p, [rc_command(info)], literal=True)
+                ctx.tmux_send(p, ["Enter"])
+                self.rc_sent[p.pid] = ctx.now()
+                ctx.sleep(5)
             ctx.tmux_send(p, ["Escape"])
             ctx.tmux_send(p, [WAKE_TEXT], literal=True)
             ctx.tmux_send(p, ["Enter"])
@@ -688,7 +711,7 @@ class Rotator:
             if free:
                 ctx.tmux_send(p, ["Escape"])
                 escape.add(p.pane)
-            ctx.tmux_send(p, [RC_TEXT], literal=True)
+            ctx.tmux_send(p, [rc_command(info)], literal=True)
             ctx.tmux_send(p, ["Enter"])
             self.rc_sent[p.pid] = ctx.now()
             sent.append(p.pane)

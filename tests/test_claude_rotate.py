@@ -292,6 +292,28 @@ def test_limit_in_transcript_rotates_and_wakes_the_session(w, two):
     assert w.sent == [("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
 
 
+
+def test_wake_asks_for_a_status_summary_before_continuing():
+    assert "status summary" in cr.WAKE_TEXT
+    assert cr.WAKE_TEXT.index("summary") < cr.WAKE_TEXT.index("continue where you stopped")
+
+
+def test_wake_reconnects_remote_control_by_name_before_the_summary(w, two):
+    (Path(two) / "settings.json").write_text(json.dumps({"remoteControlAtStartup": True}))
+    transcript = Path(two) / "projects" / "-repo" / "s1.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(limit_line(NOW - 100) + "\n")
+    (Path(two) / "sessions").mkdir()
+    (Path(two) / "sessions" / "4242.json").write_text(json.dumps(
+        {"sessionId": "s1", "kind": "interactive", "status": "idle", "bridgeSessionId": None, "name": "yedran-81"}))
+    w.procs = [cr.Proc(4242, two, "%1", None)]
+    rot = cr.Rotator(w.ctx)
+    assert rot.wake(two) == ["%1"]
+    assert w.sent == [("%1", ("Escape",), False), ("%1", ("/remote-control yedran-81",), True), ("%1", ("Enter",), False),
+                      ("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    w.sent.clear()
+    assert rot.reconnect(two) == []
+
 def test_limit_from_before_the_switch_is_ignored(w, two):
     transcript = Path(two) / "projects" / "-repo" / "s1.jsonl"
     transcript.parent.mkdir(parents=True)
@@ -326,6 +348,14 @@ def test_reconnect_runs_remote_control_in_every_session_without_bridge(w, two, s
     assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
     assert w.sent == keys
 
+
+
+def test_reconnect_names_the_remote_session_after_the_local_one(w, two):
+    rc_session(w, two, "busy")
+    info = Path(two) / "sessions" / "4242.json"
+    info.write_text(json.dumps({**json.loads(info.read_text()), "name": "calm-your-socks-16"}))
+    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert w.sent == [("%1", ("/remote-control calm-your-socks-16",), True), ("%1", ("Enter",), False)]
 
 @pytest.mark.parametrize("status", ["idle", "busy"])
 def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
