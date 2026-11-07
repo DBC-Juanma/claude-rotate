@@ -42,7 +42,7 @@ RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
 SHELLS = ("bash", "zsh", "sh", "fish", "dash")
 IDLE_STOPS = ("end_turn", "stop_sequence")
-LIMIT_RE = re.compile(r"hit your (session |usage |weekly )?limit|usage limit reached|rate_limit.{0,200}429|429.{0,200}rate_limit", re.I | re.S)
+LIMIT_RE = re.compile(r"hit your ([\w-]+ )?limit|usage limit reached|rate_limit.{0,200}429|429.{0,200}rate_limit", re.I | re.S)
 RESET_RE = re.compile(
     r"resets\s+(?:(?P<mon>[A-Z][a-z]{2})[a-z]*\s+(?P<day>\d{1,2}),?\s+)?"
     r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>am|pm)(?:\s*\((?P<tz>[^)]+)\))?",

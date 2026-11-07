@@ -122,6 +122,15 @@ def test_entry_limit_matches_synthetic_limit_error():
     assert hit == cr.Hit(LIMIT_TEXT, NOW, "u7")
 
 
+@pytest.mark.parametrize("text", [
+    "You've hit your 5-hour limit · resets 12:10pm (Asia/Ho_Chi_Minh)",
+    "You've hit your session limit · resets 12:10pm (Asia/Ho_Chi_Minh)",
+    "You've hit your weekly limit · resets Oct 25, 3:30am (UTC)",
+])
+def test_entry_limit_matches_every_limit_wording(text):
+    assert cr.entry_limit(limit_line(NOW, uuid="u8", text=text)) == cr.Hit(text, NOW, "u8")
+
+
 def test_entry_limit_ignores_model_text_quoting_the_limit():
     e = json.loads(limit_line(NOW))
     e["message"]["model"] = "claude-opus-5-5"
