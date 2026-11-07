@@ -28,8 +28,8 @@ TAIL_BYTES = 262144
 RENEW_EVERY = 6 * 3600
 RENEW_TIMEOUT = 180
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-DEAD_RE = re.compile(r"expired|could not be refreshed|not logged in|please run /login|invalid.{0,20}(token|grant)|unauthorized|authentication", re.I)
-AUTH_RE = re.compile(r"please run /login|oauth token has expired|invalid authentication credentials|authentication_error|not logged in|invalid api key", re.I)
+LIMIT_ERROR = "usage_limit_reached"
+AUTH_ERROR = "authentication_failed"
 WAKE_TEXT = ("Account rotated (claude-rotate). Before anything else, write a short status summary for whoever follows "
              "this session remotely: what you were doing, what is done, what is pending and the next step. "
              "Then continue where you stopped.")
@@ -44,12 +44,6 @@ RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
 SHELLS = ("bash", "zsh", "sh", "fish", "dash")
 IDLE_STOPS = ("end_turn", "stop_sequence")
-LIMIT_RE = re.compile(r"hit your ([\w-]+ )?limit|usage limit reached|rate_limit.{0,200}429|429.{0,200}rate_limit", re.I | re.S)
-RESET_RE = re.compile(
-    r"resets\s+(?:(?P<mon>[A-Z][a-z]{2})[a-z]*\s+(?P<day>\d{1,2}),?\s+)?"
-    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>am|pm)(?:\s*\((?P<tz>[^)]+)\))?",
-    re.I,
-)
 
 
 class Proc(NamedTuple):
@@ -365,34 +359,6 @@ def next_available(ctx: Ctx, cur: Optional[str]) -> Optional[str]:
     return None
 
 
-def parse_reset(text: str, now: float) -> Optional[float]:
-    """Parse 'resets 9pm (Europe/Madrid)' into an epoch after now (local time when no zone is given), or None."""
-    from zoneinfo import ZoneInfo
-    m = RESET_RE.search(text)
-    if not m:
-        return None
-    try:
-        tz = ZoneInfo(m.group("tz")) if m.group("tz") else None
-    except Exception:
-        return None
-    hour = int(m.group("h")) % 12 + (12 if m.group("ap").lower() == "pm" else 0)
-    minute = int(m.group("m") or 0)
-    base = dt.datetime.fromtimestamp(now, tz)
-    if m.group("mon"):
-        try:
-            month = dt.datetime.strptime(m.group("mon")[:3].title(), "%b").month
-            cand = base.replace(month=month, day=int(m.group("day")), hour=hour, minute=minute, second=0, microsecond=0)
-        except ValueError:
-            return None
-        if cand.timestamp() <= now:
-            cand = cand.replace(year=cand.year + 1)
-        return cand.timestamp()
-    cand = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if cand.timestamp() <= now:
-        cand += dt.timedelta(days=1)
-    return cand.timestamp()
-
-
 def live_emails(ctx: Ctx) -> set:
     """Emails currently logged in on any configured config dir."""
     return {e for e in (current_email(cd) for cd in load_config(ctx)["config_dirs"] if Path(cd).is_dir()) if e}
@@ -421,6 +387,7 @@ def renew(ctx: Ctx, email: str) -> str:
             except (subprocess.TimeoutExpired, OSError) as e:
                 ctx.log("renew_error", email=email, reason=type(e).__name__)
                 return "error"
+            errors = api_errors(t)
             new = (read_json(Path(t) / ".credentials.json", {}) or {}).get("claudeAiOauth")
         if usable_oauth(new) and new != slot["claudeAiOauth"]:
             slot["claudeAiOauth"] = new
@@ -432,7 +399,7 @@ def renew(ctx: Ctx, email: str) -> str:
         failed = rc != 0 or not isinstance(res, dict) or res.get("is_error")
         if failed:
             text = str(res.get("result") if isinstance(res, dict) else out).strip().replace("\n", " ")[:160]
-            if DEAD_RE.search(text):
+            if AUTH_ERROR in errors:
                 return _mark_dead(ctx, email, text)
             ctx.log("renew_error", email=email, reason=text or f"exit {rc}")
             return "error"
@@ -475,9 +442,11 @@ def check(ctx: Ctx) -> int:
 
 
 class Hit(NamedTuple):
+    kind: str
     text: str
     ts: Optional[float]
     uuid: Optional[str]
+    resets: Optional[float] = None
 
 
 def entry_ts(e: dict) -> Optional[float]:
@@ -488,8 +457,11 @@ def entry_ts(e: dict) -> Optional[float]:
         return None
 
 
-def entry_limit(line: str, pattern=None) -> Optional[Hit]:
-    """Return a Hit if this transcript line is Claude Code's own error matching pattern (default: usage limit), else None."""
+def entry_error(line: str) -> Optional[Hit]:
+    """Return a Hit when this transcript line is Claude Code's own usage-limit ('limit') or login ('auth') error, else None.
+
+    Read from the structured fields Claude Code writes on the entry (apiError, error, quotaLimits), never from its text.
+    """
     try:
         e = json.loads(line)
     except ValueError:
@@ -499,11 +471,28 @@ def entry_limit(line: str, pattern=None) -> Optional[Hit]:
     msg = e.get("message") if isinstance(e.get("message"), dict) else {}
     if msg.get("model") != "<synthetic>":
         return None
+    kind = "limit" if e.get("apiError") == LIMIT_ERROR else "auth" if e.get("error") == AUTH_ERROR else None
+    if kind is None:
+        return None
     content = msg.get("content")
     if isinstance(content, list):
         content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-    text = str(content or "")
-    return Hit(text, entry_ts(e), e.get("uuid")) if (pattern or LIMIT_RE).search(text) else None
+    resets = (e.get("quotaLimits") or {}).get("resetsAt")
+    return Hit(kind, str(content or ""), entry_ts(e), e.get("uuid"), float(resets) if resets else None)
+
+
+def api_errors(config_dir: str) -> set:
+    """The error kinds (the entries' error field) Claude Code recorded in the transcripts under config_dir."""
+    kinds = set()
+    for f in glob.glob(os.path.join(config_dir, "projects", "**", "*.jsonl"), recursive=True):
+        for line in Path(f).read_text(errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(e, dict) and e.get("isApiErrorMessage") and e.get("error"):
+                kinds.add(e["error"])
+    return kinds
 
 
 def last_turn_entry(path: str) -> Optional[str]:
@@ -635,12 +624,11 @@ class Rotator:
             self.offsets[f] = off + end + 1
             for raw in chunk[:end].split(b"\n"):
                 line = raw.decode(errors="replace")
-                hit = entry_limit(line)
-                if hit:
+                hit = entry_error(line)
+                if hit and hit.kind == "limit":
                     hits.append(hit)
-                auth = entry_limit(line, AUTH_RE)
-                if auth:
-                    self.auth_hits.setdefault(cd, []).append(auth)
+                elif hit:
+                    self.auth_hits.setdefault(cd, []).append(hit)
         return hits
 
     def wake(self, cd: str) -> list:
@@ -659,7 +647,7 @@ class Rotator:
                 continue
             path = session_transcript(cd, p.pid)
             line = last_turn_entry(path) if path else None
-            hit = (entry_limit(line) or entry_limit(line, AUTH_RE)) if line else None
+            hit = entry_error(line) if line else None
             if not hit or (hit.uuid or path) in self.woken:
                 continue
             info = session_info(cd, p.pid)
@@ -698,7 +686,8 @@ class Rotator:
                 continue
             path = session_transcript(cd, p.pid)
             line = last_turn_entry(path) if path else None
-            if line and entry_limit(line):
+            hit = entry_error(line) if line else None
+            if hit and hit.kind == "limit":
                 continue
             screen = ctx.tmux_capture(p)
             if not prompt_empty(screen):
@@ -797,13 +786,8 @@ class Rotator:
         if not fresh:
             ctx.log("limit_inflight_ignored", config_dir=cd, count=len(hits))
             return
-        texts = [h.text for h in fresh]
         cur = current_email(cd)
-        until = None
-        for t in texts:
-            until = parse_reset(t, ctx.now())
-            if until:
-                break
+        until = next((h.resets for h in fresh if h.resets), None)
         fallback = until is None
         until = until or ctx.now() + FALLBACK_HOURS * 3600
         with ctx.lock():

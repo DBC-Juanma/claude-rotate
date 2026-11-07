@@ -11,6 +11,8 @@ import claude_rotate as cr
 MADRID = ZoneInfo("Europe/Madrid")
 NOW = dt.datetime(2026, 10, 22, 10, 0, tzinfo=MADRID).timestamp()
 LIMIT_TEXT = "You've hit your limit · resets 9pm (Europe/Madrid)"
+RESET = dt.datetime(2026, 10, 22, 21, 0, tzinfo=MADRID).timestamp()
+AUTH_TEXT = "Failed to authenticate: OAuth session expired and could not be refreshed"
 OK_RESULT = json.dumps({"type": "result", "is_error": False, "result": "ok"})
 
 
@@ -30,12 +32,21 @@ def make_cd(base: Path, name: str, email: str, tokens: dict) -> str:
     return str(cd)
 
 
-def limit_line(ts: float, uuid: str = "u-limit", text: str = LIMIT_TEXT) -> str:
+def error_line(ts: float, uuid: str, text: str, **fields) -> str:
     return json.dumps({
         "type": "assistant", "isApiErrorMessage": True, "uuid": uuid,
         "timestamp": dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z"),
-        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]},
+        "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}, **fields,
     })
+
+
+def limit_line(ts: float, uuid: str = "u-limit", text: str = LIMIT_TEXT, resets: float = RESET) -> str:
+    return error_line(ts, uuid, text, error="rate_limit", apiError="usage_limit_reached", apiErrorStatus=429,
+                      quotaLimits={"status": "rejected", "resetsAt": int(resets), "rateLimitType": "five_hour"})
+
+
+def auth_line(ts: float, uuid: str = "u-auth") -> str:
+    return error_line(ts, uuid, AUTH_TEXT, error="authentication_failed")
 
 
 class Clock:
@@ -58,6 +69,7 @@ class World:
         self.claude_runs = []
         self.claude_reply = (0, OK_RESULT)
         self.claude_writes = None
+        self.claude_error = None
         self.screen = "● done\n───\n❯ \n───\n  status line\n"
         self.ctx = cr.Ctx(root=tmp_path / "root", now=self.clock, sleep=lambda s: None,
                           list_procs=lambda: self.procs, tmux_send=self._send, tmux_capture=lambda p: self.screen,
@@ -71,6 +83,10 @@ class World:
         self.claude_runs.append(json.loads((Path(config_dir) / ".claude.json").read_text())["oauthAccount"]["emailAddress"])
         if self.claude_writes:
             (Path(config_dir) / ".credentials.json").write_text(json.dumps({"claudeAiOauth": self.claude_writes}))
+        if self.claude_error:
+            transcript = Path(config_dir) / "projects" / "-renew" / "s.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(self.claude_error + "\n")
         return self.claude_reply
 
     def creds(self, cd: str) -> dict:
@@ -99,48 +115,29 @@ def two(w):
     return cd_a
 
 
-def test_parse_reset_later_today_in_named_zone():
-    assert cr.parse_reset(LIMIT_TEXT, NOW) == dt.datetime(2026, 10, 22, 21, 0, tzinfo=MADRID).timestamp()
+def test_entry_error_reads_a_limit_and_its_reset_from_the_structured_fields():
+    assert cr.entry_error(limit_line(NOW, uuid="u7")) == cr.Hit("limit", LIMIT_TEXT, NOW, "u7", RESET)
 
 
-def test_parse_reset_rolls_to_tomorrow_when_hour_has_passed():
-    late = dt.datetime(2026, 10, 22, 22, 30, tzinfo=MADRID).timestamp()
-    assert cr.parse_reset(LIMIT_TEXT, late) == dt.datetime(2026, 10, 23, 21, 0, tzinfo=MADRID).timestamp()
+def test_entry_error_does_not_depend_on_the_wording():
+    text = "Has alcanzado tu límite de sesión · se restablece a las 21:00"
+    assert cr.entry_error(limit_line(NOW, uuid="u8", text=text)) == cr.Hit("limit", text, NOW, "u8", RESET)
 
 
-def test_parse_reset_with_date_and_minutes():
-    text = "You've hit your weekly limit · resets Oct 25, 3:30am (UTC)"
-    assert cr.parse_reset(text, NOW) == dt.datetime(2026, 10, 25, 3, 30, tzinfo=dt.timezone.utc).timestamp()
+def test_entry_error_ignores_a_short_lived_rate_limit():
+    line = error_line(NOW, "u9", "API Error: Request rejected (429) · This request would exceed your account's rate limit.",
+                      error="rate_limit", apiErrorStatus=429)
+    assert cr.entry_error(line) is None
 
 
-def test_parse_reset_without_reset_time_is_none():
-    assert cr.parse_reset("Usage limit reached", NOW) is None
+def test_entry_error_reads_an_expired_login():
+    assert cr.entry_error(auth_line(NOW, uuid="u10")) == cr.Hit("auth", AUTH_TEXT, NOW, "u10")
 
 
-def test_entry_limit_matches_synthetic_limit_error():
-    hit = cr.entry_limit(limit_line(NOW, uuid="u7"))
-    assert hit == cr.Hit(LIMIT_TEXT, NOW, "u7")
-
-
-@pytest.mark.parametrize("text", [
-    "You've hit your 5-hour limit · resets 12:10pm (Asia/Ho_Chi_Minh)",
-    "You've hit your session limit · resets 12:10pm (Asia/Ho_Chi_Minh)",
-    "You've hit your weekly limit · resets Oct 25, 3:30am (UTC)",
-])
-def test_entry_limit_matches_every_limit_wording(text):
-    assert cr.entry_limit(limit_line(NOW, uuid="u8", text=text)) == cr.Hit(text, NOW, "u8")
-
-
-def test_entry_limit_ignores_model_text_quoting_the_limit():
+def test_entry_error_ignores_model_text_quoting_the_limit():
     e = json.loads(limit_line(NOW))
     e["message"]["model"] = "claude-opus-5-5"
-    assert cr.entry_limit(json.dumps(e)) is None
-
-
-def test_entry_limit_with_auth_pattern():
-    line = limit_line(NOW, text="OAuth token has expired. Please run /login")
-    assert cr.entry_limit(line) is None
-    assert cr.entry_limit(line, cr.AUTH_RE).text == "OAuth token has expired. Please run /login"
+    assert cr.entry_error(json.dumps(e)) is None
 
 
 def test_enroll_adds_vault_slot_and_order(w, two):
@@ -254,12 +251,19 @@ def test_renew_stores_rotated_tokens(w, two):
 
 
 def test_renew_marks_dead_on_expired_login(w, two):
-    w.claude_reply = (1, "OAuth token has expired. Please run /login")
+    w.claude_reply = (1, json.dumps({"type": "result", "is_error": True, "result": AUTH_TEXT}))
+    w.claude_error = auth_line(NOW)
     assert cr.renew(w.ctx, "b@x") == "dead"
     dead = cr.load_state(w.ctx)["dead"]["b@x"]
-    assert dead["reason"] == "OAuth token has expired. Please run /login"
+    assert dead["reason"] == AUTH_TEXT
     assert w.slot_tokens("b@x") == oauth("b1")
 
+
+
+def test_renew_failing_for_any_other_reason_is_an_error_not_a_dead_login(w, two):
+    w.claude_reply = (1, json.dumps({"type": "result", "is_error": True, "result": "API Error: 529 overloaded"}))
+    assert cr.renew(w.ctx, "b@x") == "error"
+    assert "b@x" not in cr.load_state(w.ctx)["dead"]
 
 def test_renew_due_skips_live_and_recently_renewed(w, two):
     assert cr.renew_due(w.ctx) == {"b@x": "ok"}
