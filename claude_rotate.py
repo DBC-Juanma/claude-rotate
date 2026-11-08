@@ -43,6 +43,7 @@ CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 RC_TEXT = "/remote-control"
 RC_RETRY = 30
 PROMPT_FREE = ("idle", "shell")
+RC_ANYTIME = PROMPT_FREE + ("busy",)
 SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
@@ -654,6 +655,38 @@ def menu_cursor(screen: str) -> Optional[str]:
     return lines[-1][1:].strip() if lines else None
 
 
+VIEW_SEPARATOR_RE = re.compile(r"^─+ (.+?) ─$")
+
+
+def viewed_session(screen: str) -> Optional[str]:
+    """The name of the session an agent view shows on a captured screen: the title on the separator line right above
+    its input box (its last ❯ line), or None."""
+    lines = [ln.strip() for ln in plain(screen).replace("\xa0", " ").splitlines()]
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("❯")]
+    if not starts or starts[-1] == 0:
+        return None
+    m = VIEW_SEPARATOR_RE.match(lines[starts[-1] - 1])
+    return m.group(1) if m else None
+
+
+def pid_alive(pid) -> bool:
+    """Whether a process with this pid exists."""
+    return isinstance(pid, int) and Path(f"/proc/{pid}").exists()
+
+
+def bg_jobs(cd: str, pids: set) -> list:
+    """The daemon job states (<cd>/jobs/<jobId>/state.json) of the live background sessions of cd: those whose process
+    is in pids or still exists (the daemon runs them under its own binary name, so pgrep -x claude misses them)."""
+    jobs = []
+    for f in glob.glob(os.path.join(cd, "sessions", "*.json")):
+        info = read_json(Path(f), {}) or {}
+        if info.get("kind") == "bg" and (info.get("pid") in pids or pid_alive(info.get("pid"))) and info.get("jobId"):
+            state = read_json(Path(cd) / "jobs" / info["jobId"] / "state.json", None)
+            if state:
+                jobs.append({**state, "jobId": info["jobId"]})
+    return jobs
+
+
 def session_transcript(cd: str, pid: int) -> Optional[str]:
     """The transcript of the session a claude process is running, from <cd>/sessions/<pid>.json."""
     return transcript_path(cd, session_info(cd, pid).get("sessionId"))
@@ -774,10 +807,12 @@ class Rotator:
         return woken
 
     def reconnect(self, cd: str) -> list:
-        """Run /remote-control in each interactive tmux session of cd that has no Remote Control bridge, a free prompt and an empty input box.
+        """Run /remote-control in each interactive tmux session of cd that has no Remote Control bridge and an empty input
+        box, whether it is free or busy.
 
-        A busy session is left alone until its turn ends: typed into it, the command opens a dialog that stays open
-        when the turn ends and blocks the session. Nothing is sent in the first RC_SETTLE seconds after cd switched:
+        A busy session connects at once without a dialog and keeps working; it gets no Escape before or after the
+        command, since Escape would interrupt its turn. A session waiting on a permission prompt is left alone.
+        Nothing is sent in the first RC_SETTLE seconds after cd switched:
         the old bridge is still switching off then, and /remote-control only opens a "Remote Control isn't connected" dialog.
         """
         ctx, sent, escape = self.ctx, [], set()
@@ -788,7 +823,7 @@ class Rotator:
                 continue
             info = session_info(cd, p.pid)
             status = info.get("status")
-            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or status not in PROMPT_FREE:
+            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or status not in RC_ANYTIME:
                 continue
             last = self.rc_sent.get(p.pid)
             if last and ctx.now() - last < RC_RETRY:
@@ -796,12 +831,14 @@ class Rotator:
             screen = ctx.tmux_capture(p)
             if not prompt_empty(screen):
                 continue
-            if last and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
+            if last and status in PROMPT_FREE and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
                     and any(m in plain(screen) for m in RC_BROKEN):
                 self.restart(cd, p, info)
                 continue
-            escape.add(p.pane)
-            self.type_line(p, rc_command(cd, info))
+            free = status in PROMPT_FREE
+            if free:
+                escape.add(p.pane)
+            self.type_line(p, rc_command(cd, info), escape=free)
             self.rc_sent[p.pid] = ctx.now()
             sent.append(p.pane)
         if sent:
@@ -810,6 +847,40 @@ class Rotator:
                 if p.pane in escape:
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
+        return sent
+
+    def reconnect_bg(self, cd: str) -> list:
+        """Run /remote-control for each background session of cd whose bridge is missing or belongs to another account
+        than the one cd is on, typing it into the agent view (`claude agents`) that has the session open.
+
+        A background session has no pane of its own; the daemon keeps its bridge in its job state. The command
+        registers a new bridge under the current account at once, busy or not, so no Escape is sent. A session not
+        open in any agent view can't be reached. Returns the panes typed into.
+        """
+        ctx, sent = self.ctx, []
+        account = (live_account(cd) or {}).get("accountUuid")
+        if not rc_wanted(cd) or not account or ctx.now() - load_state(ctx)["switched_at"].get(cd, 0) < RC_SETTLE:
+            return sent
+        procs = [p for p in ctx.list_procs() if os.path.normpath(p.config_dir) == os.path.normpath(cd)]
+        due = {j["name"]: j for j in bg_jobs(cd, {p.pid for p in procs})
+               if j.get("name") and (not j.get("bridgeSessionId") or j.get("bridgeOwnerAccountUuid") != account)}
+        for p in procs:
+            if not due or not p.pane or p.pane in sent or session_info(cd, p.pid):
+                continue
+            screen = ctx.tmux_capture(p)
+            job = due.get(viewed_session(screen))
+            if not job or not prompt_empty(screen):
+                continue
+            last = self.rc_sent.get(job["jobId"])
+            if last and ctx.now() - last < RC_RETRY:
+                continue
+            title = clean_title(job["name"])
+            self.type_line(p, f"{RC_TEXT} {title}" if title else RC_TEXT, escape=False)
+            self.rc_sent[job["jobId"]] = ctx.now()
+            sent.append(p.pane)
+            del due[job["name"]]
+        if sent:
+            ctx.log("rc_reconnected_bg", config_dir=cd, panes=",".join(sent))
         return sent
 
     def stale_bridge(self, cd: str, info: dict) -> bool:
@@ -1068,6 +1139,7 @@ class Rotator:
             self.dismiss_rc_dialogs(cd)
             self.disconnect_stale(cd)
             self.reconnect(cd)
+            self.reconnect_bg(cd)
             self.summarize(cd)
         renew_due(self.ctx)
 

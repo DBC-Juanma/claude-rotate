@@ -357,7 +357,7 @@ def rc_session(w, cd: str, status: str) -> None:
     w.procs = [cr.Proc(4242, cd, "%1", None)]
 
 
-@pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", [])])
+@pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", RC_BUSY), ("waiting", [])])
 def test_reconnect_runs_remote_control_in_every_session_without_bridge(w, two, status, keys):
     rc_session(w, two, status)
     assert cr.Rotator(w.ctx).reconnect(two) == (["%1"] if keys else [])
@@ -655,3 +655,61 @@ def test_a_menu_without_the_disconnect_option_is_closed(w, two):
     assert cr.Rotator(w.ctx).disconnect_stale(two) == []
     assert w.sent == RC_FREE[:3] + [("%1", ("Escape",), False)]
     assert "rc_disconnect_failed" in w.ctx.out.getvalue()
+
+
+ZALO = "Ingeniería inversa Zalo para llamadas"
+VIEW_SCREEN = ("● La F3 está en qg.\n✻ Cogitated for 40s\n" + "─" * 40 + f" {ZALO} ─\n❯ \n" + "─" * 60 + "\n  ○ rc ~/projects\n")
+
+
+def bg_job(w, cd: str, bridge, owner, screen: str = VIEW_SCREEN) -> None:
+    """A background session of cd (pid 5151, job d98214a5, no pane) on the given bridge, open in an agent view on %9."""
+    (Path(cd) / "settings.json").write_text(json.dumps({"remoteControlAtStartup": True}))
+    (Path(cd) / "sessions").mkdir(exist_ok=True)
+    (Path(cd) / "sessions" / "5151.json").write_text(json.dumps(
+        {"pid": 5151, "sessionId": "d98214a5-7be1", "kind": "bg", "status": "busy", "jobId": "d98214a5", "name": ZALO}))
+    job = Path(cd) / "jobs" / "d98214a5"
+    job.mkdir(parents=True)
+    job.joinpath("state.json").write_text(json.dumps(
+        {"state": "working", "name": ZALO, "bridgeSessionId": bridge, "bridgeOwnerAccountUuid": owner}))
+    w.procs = [cr.Proc(5151, cd, None, None), cr.Proc(6161, cd, "%9", None)]
+    w.screen = screen
+
+
+BG_RC = [("%9", (f"/remote-control {ZALO}",), True), ("%9", ("Enter",), False)]
+
+
+def test_a_background_session_on_another_account_reconnects_from_its_agent_view(w, two):
+    bg_job(w, two, "cse_01EcKz", "uuid-juanma@x")
+    rot = cr.Rotator(w.ctx)
+    assert rot.reconnect_bg(two) == ["%9"]
+    assert w.sent == BG_RC
+    assert rot.reconnect_bg(two) == []
+
+
+def test_a_background_session_without_a_bridge_reconnects_from_its_agent_view(w, two):
+    bg_job(w, two, None, None)
+    assert cr.Rotator(w.ctx).reconnect_bg(two) == ["%9"]
+    assert w.sent == BG_RC
+
+
+def test_a_background_session_on_the_current_account_is_left_alone(w, two):
+    bg_job(w, two, "cse_01LKAW", "uuid-a@x")
+    assert cr.Rotator(w.ctx).reconnect_bg(two) == []
+    assert w.sent == []
+
+
+def test_an_agent_view_showing_another_session_is_left_alone(w, two):
+    bg_job(w, two, None, None, screen=VIEW_SCREEN.replace(ZALO, "Miniserie Claude en Blender"))
+    assert cr.Rotator(w.ctx).reconnect_bg(two) == []
+    assert w.sent == []
+
+
+def test_an_agent_view_with_a_draft_is_left_alone(w, two):
+    bg_job(w, two, None, None, screen=VIEW_SCREEN.replace("❯ \n", "❯ estoy escribiendo\n"))
+    assert cr.Rotator(w.ctx).reconnect_bg(two) == []
+    assert w.sent == []
+
+
+def test_viewed_session_reads_the_title_above_the_input_box():
+    assert cr.viewed_session(VIEW_SCREEN) == ZALO
+    assert cr.viewed_session("● done\n❯ \n") is None
