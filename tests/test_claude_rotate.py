@@ -302,21 +302,32 @@ def test_wake_asks_for_a_status_summary_before_continuing():
     assert cr.WAKE_TEXT.index("summary") < cr.WAKE_TEXT.index("continue where you stopped")
 
 
-def test_wake_reconnects_remote_control_by_name_before_the_summary(w, two):
+def test_a_session_stopped_by_the_limit_reconnects_by_name_and_is_woken_on_its_new_bridge(w, two):
     (Path(two) / "settings.json").write_text(json.dumps({"remoteControlAtStartup": True}))
     transcript = Path(two) / "projects" / "-repo" / "s1.jsonl"
     transcript.parent.mkdir(parents=True)
     transcript.write_text(limit_line(NOW - 100) + "\n")
     (Path(two) / "sessions").mkdir()
     (Path(two) / "sessions" / "4242.json").write_text(json.dumps(
-        {"sessionId": "s1", "kind": "interactive", "status": "idle", "bridgeSessionId": None, "name": "yedran-81"}))
+        {"sessionId": "s1", "kind": "interactive", "status": "idle", "bridgeSessionId": "session_old", "name": "yed18-s",
+         "nameSource": "user"}))
     w.procs = [cr.Proc(4242, two, "%1", None)]
     rot = cr.Rotator(w.ctx)
-    assert rot.wake(two) == ["%1"]
-    assert w.sent == [("%1", ("Escape",), False), ("%1", ("/remote-control yedran-81",), True), ("%1", ("Enter",), False),
-                      ("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
-    w.sent.clear()
+    rot.rotate(two)
+    assert w.sent == []
+    name_session(two, bridgeSessionId=None)
+    assert rot.wake(two) == []
     assert rot.reconnect(two) == []
+    w.clock.t += cr.RC_SETTLE
+    assert rot.reconnect(two) == ["%1"]
+    assert w.sent == [("%1", ("Escape",), False), ("%1", ("/remote-control yed18-s",), True), ("%1", ("Enter",), False),
+                      ("%1", ("Escape",), False)]
+    w.sent.clear()
+    name_session(two, bridgeSessionId="session_new")
+    assert rot.wake(two) == ["%1"]
+    assert w.sent == [("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    w.sent.clear()
+    assert rot.summarize(two) == []
 
 def test_limit_from_before_the_switch_is_ignored(w, two):
     transcript = Path(two) / "projects" / "-repo" / "s1.jsonl"
@@ -346,20 +357,125 @@ def rc_session(w, cd: str, status: str) -> None:
     w.procs = [cr.Proc(4242, cd, "%1", None)]
 
 
-@pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", RC_BUSY)])
+@pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", [])])
 def test_reconnect_runs_remote_control_in_every_session_without_bridge(w, two, status, keys):
     rc_session(w, two, status)
-    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert cr.Rotator(w.ctx).reconnect(two) == (["%1"] if keys else [])
     assert w.sent == keys
 
 
 
-def test_reconnect_names_the_remote_session_after_the_local_one(w, two):
-    rc_session(w, two, "busy")
-    info = Path(two) / "sessions" / "4242.json"
-    info.write_text(json.dumps({**json.loads(info.read_text()), "name": "calm-your-socks-16"}))
+def name_session(cd: str, **fields) -> None:
+    info = Path(cd) / "sessions" / "4242.json"
+    info.write_text(json.dumps({**json.loads(info.read_text()), **fields}))
+
+
+def write_transcript(cd: str, *entries: dict) -> None:
+    transcript = Path(cd) / "projects" / "-repo" / "s1.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+
+def test_reconnect_names_the_remote_session_after_the_name_its_user_gave_it(w, two):
+    rc_session(w, two, "idle")
+    name_session(two, name="docs-research", nameSource="user")
+    write_transcript(two, {"type": "ai-title", "aiTitle": "Docs of the research", "sessionId": "s1"})
     assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
-    assert w.sent == [("%1", ("/remote-control calm-your-socks-16",), True), ("%1", ("Enter",), False)]
+    assert w.sent == [RC_FREE[0], ("%1", ("/remote-control docs-research",), True)] + RC_FREE[2:]
+
+
+def test_reconnect_uses_the_generated_title_not_the_name_derived_from_the_directory(w, two):
+    rc_session(w, two, "idle")
+    name_session(two, name="calm-your-socks-16", nameSource="derived")
+    write_transcript(two, {"type": "ai-title", "aiTitle": "Propuesta calma your sock", "sessionId": "s1"},
+                     {"type": "user", "message": {"content": "hi"}},
+                     {"type": "ai-title", "aiTitle": "Técnica flip en el QG", "sessionId": "s1"})
+    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert w.sent == [RC_FREE[0], ("%1", ("/remote-control Técnica flip en el QG",), True)] + RC_FREE[2:]
+
+
+def test_reconnect_without_a_title_leaves_the_remote_session_unnamed(w, two):
+    rc_session(w, two, "idle")
+    name_session(two, name="vokoban-de", nameSource="derived")
+    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert w.sent == RC_FREE
+
+
+SUMMARY = [("%1", ("Escape",), False), ("%1", (cr.SUMMARY_TEXT,), True), ("%1", ("Enter",), False)]
+
+
+def rotated_session(w, cd: str, status: str, bridge) -> cr.Rotator:
+    """A session of cd with the given status, a Rotator that just switched cd to b@x while the session was on bridge
+    session_old, and the session now on bridge."""
+    rc_session(w, cd, status)
+    name_session(cd, bridgeSessionId="session_old")
+    write_transcript(cd, {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}})
+    rot = cr.Rotator(w.ctx)
+    rot.rotate(cd)
+    assert cr.current_email(cd) == "b@x"
+    assert w.sent == []
+    name_session(cd, bridgeSessionId=bridge)
+    return rot
+
+
+def test_the_summary_is_not_sent_on_the_bridge_that_dies_with_the_switch(w, two):
+    rot = rotated_session(w, two, "idle", "session_old")
+    assert rot.summarize(two) == []
+    assert w.sent == []
+
+
+def test_after_a_rotation_an_idle_session_writes_the_summary_once(w, two):
+    rot = rotated_session(w, two, "idle", "session_new")
+    assert rot.summarize(two) == ["%1"]
+    assert w.sent == SUMMARY
+    w.sent.clear()
+    assert rot.summarize(two) == []
+    assert w.sent == []
+
+
+def test_the_summary_waits_for_the_new_remote_control_bridge(w, two):
+    rot = rotated_session(w, two, "idle", None)
+    assert rot.summarize(two) == []
+    name_session(two, bridgeSessionId="session_new")
+    assert rot.summarize(two) == ["%1"]
+    assert w.sent == SUMMARY
+
+
+def test_the_summary_waits_until_a_busy_session_is_idle(w, two):
+    rot = rotated_session(w, two, "busy", "session_new")
+    assert rot.summarize(two) == []
+    assert w.sent == []
+    name_session(two, status="idle")
+    assert rot.summarize(two) == ["%1"]
+    assert w.sent == SUMMARY
+
+
+def test_the_summary_waits_for_a_draft_in_the_input_box(w, two):
+    rot = rotated_session(w, two, "idle", "session_new")
+    w.screen = "● done\n───\n❯ lanza el benchmark ya\n───\n"
+    assert rot.summarize(two) == []
+    w.screen = "● done\n───\n❯ \n───\n"
+    assert rot.summarize(two) == ["%1"]
+
+
+def test_a_session_stopped_by_the_limit_gets_only_the_wake_text(w, two):
+    rc_session(w, two, "idle")
+    name_session(two, bridgeSessionId="session_old")
+    write_transcript(two, json.loads(limit_line(NOW - 100)))
+    rot = cr.Rotator(w.ctx)
+    rot.rotate(two)
+    assert w.sent == []
+    name_session(two, bridgeSessionId="session_new")
+    assert rot.wake(two) == ["%1"]
+    assert w.sent == SUMMARY[:1] + [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    w.sent.clear()
+    assert rot.summarize(two) == []
+    assert w.sent == []
+
+
+def test_the_summary_text_does_not_ask_to_continue():
+    assert "status summary" in cr.SUMMARY_TEXT
+    assert "continue" not in cr.SUMMARY_TEXT.lower()
 
 @pytest.mark.parametrize("status", ["idle", "busy"])
 def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
@@ -370,10 +486,10 @@ def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
 
 
 def test_reconnect_types_over_a_dim_suggestion(w, two):
-    rc_session(w, two, "busy")
+    rc_session(w, two, "idle")
     w.screen = "───\n\x1b[39m❯\xa0\x1b[2mlanza el benchmark ya\x1b[0m\n───\n"
     assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
-    assert w.sent == RC_BUSY
+    assert w.sent == RC_FREE
 
 
 RC_DIALOG_SCREEN = ("● done\n───\n   Remote Control\n   This session is available in the Claude mobile app and claude.ai/code.\n"
@@ -404,6 +520,69 @@ def test_a_dialog_closed_between_ticks_is_not_escaped(w, two):
 
 
 def test_reconnect_skips_an_open_dialog(w, two):
-    rc_session(w, two, "busy")
+    rc_session(w, two, "idle")
     w.screen = "❯ earlier prompt\n   Remote Control\n   ❯ Continue\n   Enter to select · Esc to continue\n"
     assert cr.Rotator(w.ctx).reconnect(two) == []
+
+
+def test_typing_after_escape_waits_so_the_first_character_is_not_read_as_alt(w, two):
+    rc_session(w, two, "idle")
+    events = []
+    w.ctx.sleep = lambda secs: events.append(("sleep", secs))
+    w.ctx.tmux_send = lambda proc, keys, literal=False: events.append(tuple(keys))
+    cr.Rotator(w.ctx).type_line(w.procs[0], "Account rotated")
+    assert events == [("Escape",), ("sleep", cr.ESCAPE_GAP), ("Account rotated",), ("Enter",), ("sleep", cr.ESCAPE_GAP)]
+
+
+RC_NOT_CONNECTED_SCREEN = ("● done\n▔▔▔\n   Remote Control\n   × Remote Control isn't connected.\n"
+                           "   signed-in claude.ai account or organization changed on this machine — run /remote-control\n"
+                           "   To try again, choose Continue, wait about 10 seconds for Remote Control to switch off, then run /remote-control.\n"
+                           "     Disconnect this session   Can archive it now and stop a later --resume reconnecting it\n"
+                           "   ❯ Continue\n   Enter to select · Esc to continue\n")
+
+
+def test_the_remote_control_not_connected_dialog_is_closed_on_the_next_tick(w, two):
+    rc_session(w, two, "idle")
+    w.screen = RC_NOT_CONNECTED_SCREEN
+    rot = cr.Rotator(w.ctx)
+    assert rot.reconnect(two) == []
+    assert rot.dismiss_rc_dialogs(two) == []
+    assert rot.dismiss_rc_dialogs(two) == ["%1"]
+    assert w.sent == [("%1", ("Escape",), False)]
+
+
+def test_reconnect_waits_for_the_old_bridge_to_switch_off_after_a_switch(w, two):
+    rc_session(w, two, "idle")
+    rot = cr.Rotator(w.ctx)
+    cr.switch(w.ctx, two, "b@x")
+    w.clock.t = NOW + cr.RC_SETTLE - 1
+    assert rot.reconnect(two) == []
+    assert w.sent == []
+    w.clock.t = NOW + cr.RC_SETTLE
+    assert rot.reconnect(two) == ["%1"]
+    assert w.sent == RC_FREE
+
+
+STUCK_SUMMARY_SCREEN = ("● done\n───\n❯ ccount rotated (claude-rotate) and Remote Control restarted without its history. Write\n"
+                        "  a short status summary for whoever follows this session remotely\n───\n  status line\n")
+
+
+def test_a_line_left_in_the_input_box_gets_a_second_enter(w, two):
+    rc_session(w, two, "idle")
+    screens = iter([STUCK_SUMMARY_SCREEN, "● done\n───\n❯ \n───\n"])
+    w.ctx.tmux_capture = lambda p: next(screens)
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == SUMMARY + [("%1", ("Enter",), False)]
+
+
+def test_a_line_that_never_submits_is_cleared_not_left_as_a_draft(w, two):
+    rc_session(w, two, "idle")
+    w.screen = STUCK_SUMMARY_SCREEN
+    assert not cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == SUMMARY + [("%1", ("Enter",), False), ("%1", ("C-u",), False)]
+    assert "type_failed" in w.ctx.out.getvalue()
+
+
+def test_a_submitted_line_echoed_above_the_input_box_does_not_count_as_stuck():
+    screen = "❯ Account rotated (claude-rotate) and Remote Control\n● Session status\n───\n❯ \n───\n"
+    assert not cr.input_holds(screen, cr.SUMMARY_TEXT)

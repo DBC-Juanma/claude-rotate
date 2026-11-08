@@ -33,13 +33,19 @@ AUTH_ERROR = "authentication_failed"
 WAKE_TEXT = ("Account rotated (claude-rotate). Before anything else, write a short status summary for whoever follows "
              "this session remotely: what you were doing, what is done, what is pending and the next step. "
              "Then continue where you stopped.")
+SUMMARY_TEXT = ("Account rotated (claude-rotate) and Remote Control restarted without its history. Write a short status summary "
+                "for whoever follows this session remotely: what you were doing, what is done, what is pending and the next step. "
+                "Do not start any new work after it.")
+NAMED = ("user", "auto")
+ESCAPE_GAP = 0.5
 RC_TEXT = "/remote-control"
 RC_RETRY = 30
 PROMPT_FREE = ("idle", "shell")
 SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
-RC_DIALOG = ("This session is available in the Claude mobile app", "Esc to continue")
+RC_DIALOG = (("This session is available in the Claude mobile app", "Remote Control isn't connected"), "Esc to continue")
+RC_SETTLE = 20
 RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
 SHELLS = ("bash", "zsh", "sh", "fish", "dash")
@@ -544,6 +550,16 @@ def prompt_empty(screen: str) -> bool:
     return bool(prompts) and prompts[-1] == "❯"
 
 
+def input_holds(screen: str, text: str) -> bool:
+    """Whether the input box on a captured Claude Code screen (from its last ❯ line down) still holds the start of text."""
+    lines = plain(screen).replace("\xa0", " ").splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.strip().startswith("❯")]
+    if not starts:
+        return False
+    box = " ".join(ln.strip() for ln in lines[starts[-1]:]).lstrip("❯ ")
+    return text[1:30] in box
+
+
 def is_idle(line: Optional[str]) -> bool:
     """True when a session's last turn entry is a finished assistant reply or Claude Code's own error."""
     try:
@@ -556,9 +572,37 @@ def is_idle(line: Optional[str]) -> bool:
     return bool(e.get("isApiErrorMessage")) or msg.get("stop_reason") in IDLE_STOPS
 
 
-def rc_command(info: dict) -> str:
-    """The /remote-control command for a session, carrying its name so the remote session keeps it."""
-    return f"{RC_TEXT} {info['name']}" if info.get("name") else RC_TEXT
+def transcript_path(cd: str, sid: Optional[str]) -> Optional[str]:
+    """The transcript of session sid under cd, or None."""
+    found = glob.glob(os.path.join(cd, "projects", "*", f"{sid}.jsonl")) if sid else []
+    return found[0] if found else None
+
+
+def session_title(cd: str, info: dict) -> Optional[str]:
+    """The name a session shows: the one its user gave it, else the latest title Claude Code generated for it, else None.
+
+    The name Claude Code derives from the directory (nameSource "derived", e.g. yedran-81) is never returned.
+    """
+    if info.get("nameSource") in NAMED and info.get("name"):
+        return info["name"]
+    path = transcript_path(cd, info.get("sessionId"))
+    if not path:
+        return None
+    title = None
+    with open(path, "rb") as fh:
+        for raw in fh:
+            if b'"aiTitle"' in raw:
+                try:
+                    title = json.loads(raw).get("aiTitle") or title
+                except ValueError:
+                    continue
+    return title
+
+
+def rc_command(cd: str, info: dict) -> str:
+    """The /remote-control command for a session, carrying its title so the remote session keeps it."""
+    title = session_title(cd, info)
+    return f"{RC_TEXT} {title}" if title else RC_TEXT
 
 
 def rc_missing(cd: str, info: dict) -> bool:
@@ -568,11 +612,7 @@ def rc_missing(cd: str, info: dict) -> bool:
 
 def session_transcript(cd: str, pid: int) -> Optional[str]:
     """The transcript of the session a claude process is running, from <cd>/sessions/<pid>.json."""
-    sid = session_info(cd, pid).get("sessionId")
-    if not sid:
-        return None
-    found = glob.glob(os.path.join(cd, "projects", "*", f"{sid}.jsonl"))
-    return found[0] if found else None
+    return transcript_path(cd, session_info(cd, pid).get("sessionId"))
 
 
 class Rotator:
@@ -588,6 +628,34 @@ class Rotator:
         self.rc_restarted: dict = {}
         self.auth_hits: dict = {}
         self.rc_dialogs: set = set()
+        self.summary_due: dict = {}
+        self.old_bridge: dict = {}
+
+    def type_line(self, p: Proc, text: str, escape: bool = True) -> bool:
+        """Type text into p's input box and submit it, after an Escape that clears the box when escape is set.
+
+        The pause after Escape keeps the terminal from reading Escape and the first character as one Alt key. When the
+        text is still in the input box after Enter, Enter is pressed once more; if it is still there, the box is emptied
+        (Ctrl+U) so it is not left behind as a draft. Returns whether the text was submitted.
+        """
+        ctx = self.ctx
+        if escape:
+            ctx.tmux_send(p, ["Escape"])
+            ctx.sleep(ESCAPE_GAP)
+        ctx.tmux_send(p, [text], literal=True)
+        ctx.tmux_send(p, ["Enter"])
+        for retry in (["Enter"], ["C-u"]):
+            ctx.sleep(ESCAPE_GAP)
+            if not input_holds(ctx.tmux_capture(p), text):
+                return True
+            ctx.tmux_send(p, retry)
+        ctx.log("type_failed", pane=p.pane, text=text[:40])
+        return False
+
+    def rc_ready(self, cd: str, pid: int, info: dict) -> bool:
+        """Whether a session can be asked to write something for its remote viewer: Remote Control is off for cd, or its
+        bridge is up and is not the one it had when cd last switched, which dies a few seconds after the switch."""
+        return not rc_wanted(cd) or bool(info.get("bridgeSessionId")) and info["bridgeSessionId"] != self.old_bridge.get(pid)
 
     def baseline(self, cd: str) -> None:
         """Skip everything already in the transcripts of cd."""
@@ -634,8 +702,8 @@ class Rotator:
     def wake(self, cd: str) -> list:
         """Nudge each tmux session of cd whose last turn is a limit error from before the last switch.
 
-        A session that should run Remote Control and has lost its bridge gets /remote-control <name> first, so the
-        status summary the nudge asks for is the first thing the new remote session shows.
+        A session that should run Remote Control waits for its new bridge (reconnect brings it up), so the status
+        summary the nudge asks for is the first thing the new remote session shows.
         """
         ctx, woken = self.ctx, []
         st = load_state(ctx)
@@ -650,58 +718,45 @@ class Rotator:
             hit = entry_error(line) if line else None
             if not hit or (hit.uuid or path) in self.woken:
                 continue
-            info = session_info(cd, p.pid)
-            if rc_missing(cd, info):
-                ctx.tmux_send(p, ["Escape"])
-                ctx.tmux_send(p, [rc_command(info)], literal=True)
-                ctx.tmux_send(p, ["Enter"])
-                self.rc_sent[p.pid] = ctx.now()
-                ctx.sleep(5)
-            ctx.tmux_send(p, ["Escape"])
-            ctx.tmux_send(p, [WAKE_TEXT], literal=True)
-            ctx.tmux_send(p, ["Enter"])
+            if not self.rc_ready(cd, p.pid, session_info(cd, p.pid)):
+                continue
+            self.type_line(p, WAKE_TEXT)
             self.woken.add(hit.uuid or path)
+            self.summary_due.get(cd, set()).discard(p.pid)
             woken.append(p.pane)
         if woken:
             ctx.log("woke", config_dir=cd, panes=",".join(woken))
         return woken
 
     def reconnect(self, cd: str) -> list:
-        """Run /remote-control in each interactive tmux session of cd that has no Remote Control bridge and an empty input box.
+        """Run /remote-control in each interactive tmux session of cd that has no Remote Control bridge, a free prompt and an empty input box.
 
-        Busy sessions get it typed without Escape, which would interrupt the running turn; it takes effect immediately.
+        A busy session is left alone until its turn ends: typed into it, the command opens a dialog that stays open
+        when the turn ends and blocks the session. Nothing is sent in the first RC_SETTLE seconds after cd switched:
+        the old bridge is still switching off then, and /remote-control only opens a "Remote Control isn't connected" dialog.
         """
         ctx, sent, escape = self.ctx, [], set()
-        if not rc_wanted(cd):
+        if not rc_wanted(cd) or ctx.now() - load_state(ctx)["switched_at"].get(cd, 0) < RC_SETTLE:
             return sent
         for p in ctx.list_procs():
             if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in sent:
                 continue
             info = session_info(cd, p.pid)
             status = info.get("status")
-            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or status not in PROMPT_FREE + ("busy",):
+            if info.get("kind") != "interactive" or info.get("bridgeSessionId") or status not in PROMPT_FREE:
                 continue
             last = self.rc_sent.get(p.pid)
             if last and ctx.now() - last < RC_RETRY:
                 continue
-            path = session_transcript(cd, p.pid)
-            line = last_turn_entry(path) if path else None
-            hit = entry_error(line) if line else None
-            if hit and hit.kind == "limit":
-                continue
             screen = ctx.tmux_capture(p)
             if not prompt_empty(screen):
                 continue
-            free = status in PROMPT_FREE
-            if free and last and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
+            if last and ctx.now() - self.rc_restarted.get(p.pane, 0) >= RESTART_COOLDOWN and parent_is_shell(p.pid) \
                     and any(m in plain(screen) for m in RC_BROKEN):
                 self.restart(cd, p, info)
                 continue
-            if free:
-                ctx.tmux_send(p, ["Escape"])
-                escape.add(p.pane)
-            ctx.tmux_send(p, [rc_command(info)], literal=True)
-            ctx.tmux_send(p, ["Enter"])
+            escape.add(p.pane)
+            self.type_line(p, rc_command(cd, info))
             self.rc_sent[p.pid] = ctx.now()
             sent.append(p.pane)
         if sent:
@@ -712,11 +767,39 @@ class Rotator:
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
         return sent
 
-    def dismiss_rc_dialogs(self, cd: str) -> list:
-        """Close the Remote Control dialog of a connected session when it is still open on the next tick.
+    def summarize(self, cd: str) -> list:
+        """Ask each session of cd still owed a status summary since the last switch to write it, once its prompt is free.
 
-        /remote-control typed into a busy or already connected session opens that dialog and leaves the
-        session waiting on it when its turn ends; Escape is its own "continue". Returns the panes closed.
+        A session waits while it is busy, while its new Remote Control bridge is not up yet (so the summary is the first
+        thing the remote session shows), and while its input box holds a draft or a dialog. Returns the panes asked.
+        """
+        ctx, asked = self.ctx, []
+        due = self.summary_due.get(cd)
+        if not due:
+            return asked
+        alive = {p.pid: p for p in ctx.list_procs() if os.path.normpath(p.config_dir) == os.path.normpath(cd) and p.pane}
+        due &= set(alive)
+        for pid in sorted(due):
+            p, info = alive[pid], session_info(cd, pid)
+            if info.get("kind") != "interactive" or info.get("status") not in PROMPT_FREE or not self.rc_ready(cd, pid, info):
+                continue
+            path = session_transcript(cd, pid)
+            line = last_turn_entry(path) if path else None
+            hit = entry_error(line) if line else None
+            if hit and hit.kind == "limit" or not prompt_empty(ctx.tmux_capture(p)):
+                continue
+            self.type_line(p, SUMMARY_TEXT)
+            due.discard(pid)
+            asked.append(p.pane)
+        if asked:
+            ctx.log("summary_asked", config_dir=cd, panes=",".join(asked))
+        return asked
+
+    def dismiss_rc_dialogs(self, cd: str) -> list:
+        """Close a Remote Control dialog that is still open on the next tick: the one of a connected session, or the
+        "Remote Control isn't connected" one /remote-control opens while the old bridge is still switching off.
+
+        Either leaves the session waiting on it; Escape is its own "continue". Returns the panes closed.
         """
         ctx, closed, seen = self.ctx, [], set()
         if not rc_wanted(cd):
@@ -727,7 +810,7 @@ class Rotator:
             if session_info(cd, p.pid).get("kind") != "interactive":
                 continue
             lines = [ln.strip() for ln in plain(ctx.tmux_capture(p)).splitlines() if ln.strip()]
-            if not lines or not lines[-1].endswith(RC_DIALOG[1]) or not any(RC_DIALOG[0] in ln for ln in lines[-8:]):
+            if not lines or not lines[-1].endswith(RC_DIALOG[1]) or not any(m in ln for ln in lines[-10:] for m in RC_DIALOG[0]):
                 continue
             seen.add(p.pane)
             if p.pane in self.rc_dialogs:
@@ -742,9 +825,7 @@ class Rotator:
         """Exit an idle session whose /remote-control did not come up and resume it in the same pane, so it reloads its login."""
         ctx = self.ctx
         self.rc_restarted[p.pane] = ctx.now()
-        ctx.tmux_send(p, ["Escape"])
-        ctx.tmux_send(p, ["/exit"], literal=True)
-        ctx.tmux_send(p, ["Enter"])
+        self.type_line(p, "/exit")
         for _ in range(EXIT_WAIT):
             if not Path(f"/proc/{p.pid}").exists():
                 break
@@ -753,7 +834,7 @@ class Rotator:
             ctx.log("rc_restart_failed", config_dir=cd, pane=p.pane, reason="session did not exit")
             return
         env = "env -u CLAUDE_CONFIG_DIR" if Path(cd) == Path(DEFAULT_CONFIG_DIR) else f"env CLAUDE_CONFIG_DIR={shlex.quote(cd)}"
-        cmd = f"{env} claude --resume {shlex.quote(info['sessionId'])}" + (f" --name {shlex.quote(info['name'])}" if info.get("name") else "")
+        cmd = f"{env} claude --resume {shlex.quote(info['sessionId'])}"
         ctx.tmux_send(p, [cmd], literal=True)
         ctx.tmux_send(p, ["Enter"])
         ctx.log("rc_restarted", config_dir=cd, pane=p.pane, session=info["sessionId"])
@@ -775,6 +856,13 @@ class Rotator:
                 return False
             self.waiting.pop(cd, None)
             switch(ctx, cd, nxt, reason="limit")
+        for p in ctx.list_procs():
+            if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane:
+                continue
+            info = session_info(cd, p.pid)
+            self.old_bridge[p.pid] = info.get("bridgeSessionId")
+            if info.get("kind") == "interactive":
+                self.summary_due.setdefault(cd, set()).add(p.pid)
         self.baseline(cd)
         self.wake(cd)
         return True
@@ -881,6 +969,7 @@ class Rotator:
             self.wake(cd)
             self.dismiss_rc_dialogs(cd)
             self.reconnect(cd)
+            self.summarize(cd)
         renew_due(self.ctx)
 
     def run(self, interval: float) -> None:
