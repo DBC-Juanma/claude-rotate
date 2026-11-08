@@ -1,6 +1,6 @@
 # claude-rotate
 
-Switches Claude Code to another of your accounts when one hits its usage limit, and nudges the stopped sessions to carry on.
+Switches Claude Code to another of your accounts when one hits its usage limit, nudges the stopped sessions to carry on, and keeps Remote Control alive across the switch.
 
 A single Python file with no dependencies, running as a background watcher on Linux.
 
@@ -19,13 +19,65 @@ When you have several Claude subscriptions (personal and work, or more than one 
 
 claude-rotate keeps a **vault** with one token slot per account and runs a watch loop every 15 seconds:
 
-1. **Detects the limit.** It tails Claude Code's transcripts (`<config-dir>/projects/**/*.jsonl`) for the synthetic error message Claude Code writes when a limit is hit. It parses the reset time from that message (for example `resets 9pm (Europe/Madrid)`), and marks the account as limited until then, or for 5 hours if it can't parse a time.
+1. **Detects the limit.** It tails Claude Code's transcripts (`<config-dir>/projects/**/*.jsonl`, subagent transcripts included) for the synthetic error entry Claude Code writes when a request fails. It reads the entry's structured fields, never its text: `apiError == "usage_limit_reached"` is a usage limit and `quotaLimits.resetsAt` is when it resets; `error == "authentication_failed"` is an expired login. The account is marked limited until `resetsAt`, or for 5 hours if the entry has none. A short-lived 429 is not a quota limit and is ignored, and a reworded or translated message doesn't break detection.
 2. **Switches.** It saves the outgoing account's live tokens to its slot, then writes the next available account (round-robin, skipping limited and dead ones) into the config dir's `.credentials.json` and `.claude.json`. Every other key in those files is left alone.
-3. **Wakes sessions.** In every tmux pane whose last turn ended in that limit, it sends **Escape**, then `Account rotated (claude-rotate): continue where you stopped.`, then **Enter**. The session picks up on the new account.
+3. **Wakes sessions.** In every tmux pane whose last turn ended in that limit, it types a nudge that asks the session to write a short status summary (what it was doing, what is done, what is pending, the next step) and then continue where it stopped. The session picks up on the new account. Every other interactive session is asked for the same summary, without continuing, once its prompt is free (see [Remote Control and the status summary](#remote-control-and-the-status-summary)).
 4. **Files every token under its real owner.** When the live tokens change (a session refreshed them, or a session still on the old account wrote its token), it asks the OAuth profile endpoint who owns the token and stores it in that account's slot. If the token belongs to a different account than the one the config dir should be on, it puts the right tokens back. If the owner can't be resolved, for example because there's no network, it writes nothing. It never guesses.
-5. **Keeps idle accounts alive.** Every 6 hours, each enrolled account that isn't in use gets a one-word `claude -p` call. The call runs in a throwaway config dir, so the tokens refresh and get stored without touching your real one.
+5. **Keeps idle accounts alive.** Every 6 hours, each enrolled account that isn't in use gets a one-word `claude -p` call. The call runs in a throwaway config dir, so the tokens refresh and get stored without touching your real one. A renewal that fails with `error == "authentication_failed"` in the throwaway dir's transcript marks the account dead; any other failure is reported as an error and retried later.
 6. **Comes back.** When every account is limited, it logs `all_limited` and waits. As soon as one is free again, it switches and wakes the sessions.
-7. **Optional: Remote Control.** If a config dir sets `"remoteControlAtStartup": true` in its `settings.json`, it re-runs `/remote-control` in sessions that lost their bridge as soon as their prompt is free (idle, or only running background shells). If the bridge still doesn't come up, it restarts the session in the same pane with `claude --resume`.
+7. **Optional: Remote Control.** If a config dir sets `"remoteControlAtStartup": true` in its `settings.json`, it re-runs `/remote-control <title>` in sessions that lost their bridge as soon as their prompt is free (idle, or only running background shells). If the bridge still doesn't come up, it restarts the session in the same pane with `claude --resume`.
+
+### The watch loop
+
+```mermaid
+flowchart TD
+    T([tick, every 15 s]) --> R[Reconcile live tokens:<br/>file them under their real owner]
+    R --> S[Scan new transcript lines]
+    S -->|apiError = usage_limit_reached| L[Mark account limited<br/>until quotaLimits.resetsAt or 5 h]
+    S -->|error = authentication_failed<br/>or live login unusable| D[Mark account dead]
+    S -->|nothing new| V{Current account limited<br/>and another one free?}
+    L --> N{Next available account?}
+    D --> N
+    V -->|yes| N
+    V -->|no| W
+    N -->|none| A[Log all_limited and wait]
+    N -->|found| SW[Switch: save outgoing tokens,<br/>write the next account]
+    SW --> M[Mark every interactive session<br/>as owed a summary; remember its old bridge]
+    M --> W[Wake sessions stopped by the limit<br/>once on a new bridge: summary + continue]
+    W --> RC[Reconnect Remote Control in free sessions<br/>20 s after the switch: /remote-control title]
+    RC --> SU[Ask the other sessions for the summary<br/>once free and on a new bridge]
+    SU --> RN[Renew idle accounts every 6 h]
+    A --> RN
+    RN --> T
+```
+
+### The state of an account
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available: login / enroll
+    Available --> Live: switched to it
+    Live --> Limited: usage_limit_reached
+    Limited --> Available: resetsAt passes (5 h without one)
+    Live --> Available: switched away
+    Available --> Available: renewed every 6 h while idle
+    Live --> Dead: authentication_failed or no usable tokens
+    Available --> Dead: renewal fails with authentication_failed
+    Dead --> Available: log in again and enroll
+```
+
+`Live` is the account a config dir is on. A limited or dead account is skipped when choosing the next one.
+
+## Remote Control and the status summary
+
+A rotation changes the claude.ai account the machine is signed in to, so Claude Code drops every session's Remote Control bridge ("signed-in claude.ai account or organization changed"). A new bridge starts a new remote session with no history, so whoever follows the session from the phone or claude.ai would lose track of it. With `"remoteControlAtStartup": true`, claude-rotate:
+
+1. **Waits for the old bridge to switch off.** For about 10 seconds after the switch, `/remote-control` only opens a "Remote Control isn't connected" dialog, so nothing is sent in the first 20 seconds.
+2. **Reconnects free sessions only.** `/remote-control` is typed into a session whose prompt is free (idle or shell) and whose input box is empty; a draft you're typing is never touched. A busy session is left alone until its turn ends: typed into it, the command opens a dialog that stays open when the turn ends and blocks the session. A Remote Control dialog left open is closed on the next tick.
+3. **Keeps the session's name.** The command carries the session's title, so the remote session shows the same name: the name you gave it (`/rename`, `--name`), else the latest title Claude Code generated for it (its `ai-title` entry). The name Claude Code derives from the directory (for example `yedran-81`) is never used. Titles are cleaned before they're typed: control characters and escapes are removed, whitespace is collapsed and they're cut to 80 characters.
+4. **Asks for a status summary on the new bridge.** Every interactive session that was running at the switch writes a short status summary, so it's the first thing the new remote session shows. A session waits until its prompt is free and its bridge is a new one (the session registry still shows the old bridge for a few seconds after the switch). Sessions stopped by the limit then continue; the rest stop after the summary.
+
+Everything is typed with tmux: Escape, a short pause (without it the terminal reads Escape and the first letter as an Alt key), the text, Enter. If the text is still in the input box after Enter, it presses Enter again, and if that doesn't send it either, it clears the box rather than leaving it there as a draft.
 
 ## Requirements
 
@@ -88,7 +140,7 @@ The unit runs `~/.local/bin/claude-rotate watch`, which is where `uv tool instal
 
 Every new session starts with Remote Control on. After a rotation, claude-rotate re-runs `/remote-control` in idle sessions that lost their bridge, and restarts with `claude --resume` any session whose bridge still doesn't come up.
 
-**5. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `woke`, and the panes continue on their own.
+**5. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `rc_reconnected` → `woke` / `summary_asked`, and the panes continue on their own.
 
 ## Commands
 
@@ -125,11 +177,15 @@ Reorder `order` to change the rotation order. Edit the file while the watcher is
 ## Caveats
 
 - **Outside tmux nothing types "continue" for you.** The account is still switched, but a session running in a plain terminal, an IDE or the desktop app stays stopped on the limit message until you type `continue` yourself.
-- **The nudge is typed into the pane.** If you're halfway through writing a prompt in that pane when the limit hits, the Escape and the nudge mix with your input. The nudge also counts as a normal turn on the new account.
+- **The nudge is typed into the pane.** It waits while the input box holds a draft, but if you start typing in the same second it's sent, the two can mix. The nudge counts as a normal turn on the new account.
+- **The summary costs quota.** Every interactive session writes one after every rotation, and each one re-reads that session's whole context on the new account, often with a cold cache. With many large sessions this takes a visible bite of the new account's limit.
+- **Busy sessions reconnect late.** A session that stays busy (for example waiting on a long workflow) gets Remote Control back, and writes its summary, only when its turn ends.
+- **Background sessions aren't reached.** Sessions the Claude Code daemon runs in the background have no tmux pane, so claude-rotate can't reconnect their Remote Control or ask them for a summary.
+- **The generated title can be old.** A session you never named shows the title Claude Code generated for it, which can stay from an earlier topic. Give the session a name (`/rename`) to control what the remote session shows.
 - **The switch applies to the whole config dir, not to one session.** Every session sharing a `CLAUDE_CONFIG_DIR` moves to the new account together. To keep accounts apart, use separate config dirs and add each one to `config_dirs`.
 - **Never enroll the same login twice.** Two slots holding the same refresh-token family revoke each other the first time either one refreshes, and both end up logged out. Always enroll from a fresh login, never from a config dir that shares its login with another one.
 - **Dead accounts stay dead until you fix them.** When an account's tokens are rejected, it's marked `DEAD` in `status` and skipped from then on. To bring it back, log in again in a temporary dir and re-run `enroll`.
-- **It depends on Claude Code's messages.** Limit detection matches the wording of Claude Code's limit and auth errors, and the reset-time format. If a Claude Code update changes that wording, detection can stop working until the patterns are updated.
+- **It depends on Claude Code's transcript format.** Detection reads the `apiError`, `error` and `quotaLimits.resetsAt` fields of Claude Code's error entries, and Remote Control handling reads `<config-dir>/sessions/<pid>.json`. The message wording doesn't matter, but if a Claude Code update renames those fields, detection stops until the code is updated.
 - **Detection isn't instant.** It polls every 15 seconds. Limit errors in the 90 seconds after a switch are treated as requests that were already in flight and ignored.
 - **Renewal uses a bit of quota.** The idle renewal sends one tiny `claude -p` prompt per idle account every 6 hours.
 - **Environment variables win.** Sessions started with `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` ignore the credentials file, so rotation does nothing for them.
