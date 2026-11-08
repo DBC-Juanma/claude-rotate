@@ -38,6 +38,8 @@ SUMMARY_TEXT = ("Account rotated (claude-rotate) and Remote Control restarted wi
                 "Do not start any new work after it.")
 NAMED = ("user", "auto")
 ESCAPE_GAP = 0.5
+TITLE_MAX = 80
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 RC_TEXT = "/remote-control"
 RC_RETRY = 30
 PROMPT_FREE = ("idle", "shell")
@@ -578,24 +580,34 @@ def transcript_path(cd: str, sid: Optional[str]) -> Optional[str]:
     return found[0] if found else None
 
 
+def clean_title(title) -> Optional[str]:
+    """title as a single line safe to type into a terminal: control characters and ESC removed, whitespace collapsed,
+    at most TITLE_MAX characters; None when nothing is left or title is not a string."""
+    if not isinstance(title, str):
+        return None
+    return " ".join(CONTROL_RE.sub(" ", title).split())[:TITLE_MAX].strip() or None
+
+
 def session_title(cd: str, info: dict) -> Optional[str]:
     """The name a session shows: the one its user gave it, else the latest title Claude Code generated for it, else None.
 
     The name Claude Code derives from the directory (nameSource "derived", e.g. yedran-81) is never returned.
     """
-    if info.get("nameSource") in NAMED and info.get("name"):
-        return info["name"]
+    if info.get("nameSource") in NAMED and clean_title(info.get("name")):
+        return clean_title(info["name"])
     path = transcript_path(cd, info.get("sessionId"))
     if not path:
         return None
     title = None
     with open(path, "rb") as fh:
         for raw in fh:
-            if b'"aiTitle"' in raw:
+            if b'"ai-title"' in raw:
                 try:
-                    title = json.loads(raw).get("aiTitle") or title
+                    e = json.loads(raw)
                 except ValueError:
                     continue
+                if isinstance(e, dict) and e.get("type") == "ai-title":
+                    title = clean_title(e.get("aiTitle")) or title
     return title
 
 
