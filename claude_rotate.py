@@ -48,6 +48,8 @@ DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
 RC_DIALOG = (("This session is available in the Claude mobile app", "Remote Control isn't connected"), "Esc to continue")
 RC_SETTLE = 20
+RC_DISCONNECT = "Disconnect this session"
+MENU_STEPS = 4
 RESTART_COOLDOWN = 1800
 EXIT_WAIT = 30
 SHELLS = ("bash", "zsh", "sh", "fish", "dash")
@@ -622,6 +624,36 @@ def rc_missing(cd: str, info: dict) -> bool:
     return rc_wanted(cd) and info.get("kind") == "interactive" and not info.get("bridgeSessionId")
 
 
+def bridge_key(bridge_id: Optional[str]) -> Optional[str]:
+    """The id part shared by a bridge's session_<id> (sessions/<pid>.json) and cse_<id> (transcript) names."""
+    return bridge_id.split("_", 1)[-1] if bridge_id else None
+
+
+def bridge_owner(cd: str, info: dict) -> Optional[str]:
+    """The account uuid that registered the session's current Remote Control bridge, from the transcript's
+    bridge-session entries; None when the session has no bridge or no entry names it."""
+    key, path = bridge_key(info.get("bridgeSessionId")), transcript_path(cd, info.get("sessionId"))
+    if not key or not path:
+        return None
+    owner = None
+    with open(path, "rb") as fh:
+        for raw in fh:
+            if b'"bridge-session"' in raw:
+                try:
+                    e = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("type") == "bridge-session" and bridge_key(e.get("bridgeSessionId")) == key:
+                    owner = e.get("ownerAccountUuid") or owner
+    return owner
+
+
+def menu_cursor(screen: str) -> Optional[str]:
+    """The option under the cursor (the last ❯ line) of a menu on a captured screen, or None."""
+    lines = [ln.strip() for ln in plain(screen).replace("\xa0", " ").splitlines() if ln.strip().startswith("❯")]
+    return lines[-1][1:].strip() if lines else None
+
+
 def session_transcript(cd: str, pid: int) -> Optional[str]:
     """The transcript of the session a claude process is running, from <cd>/sessions/<pid>.json."""
     return transcript_path(cd, session_info(cd, pid).get("sessionId"))
@@ -642,6 +674,7 @@ class Rotator:
         self.rc_dialogs: set = set()
         self.summary_due: dict = {}
         self.old_bridge: dict = {}
+        self.owners: dict = {}
 
     def type_line(self, p: Proc, text: str, escape: bool = True) -> bool:
         """Type text into p's input box and submit it, after an Escape that clears the box when escape is set.
@@ -778,6 +811,59 @@ class Rotator:
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
         return sent
+
+    def stale_bridge(self, cd: str, info: dict) -> bool:
+        """Whether the session's Remote Control bridge was registered by another account than the one cd is on now.
+
+        Older Claude Code versions keep their bridge across an account switch, so the session stays listed under the
+        old account. The owner of a bridge never changes, so it is read once per bridge.
+        """
+        key = bridge_key(info.get("bridgeSessionId"))
+        account = (live_account(cd) or {}).get("accountUuid")
+        if not key or not account:
+            return False
+        if key not in self.owners:
+            self.owners[key] = bridge_owner(cd, info)
+        return self.owners[key] is not None and self.owners[key] != account
+
+    def disconnect_stale(self, cd: str) -> list:
+        """Disconnect the Remote Control bridge of each free session of cd whose bridge belongs to another account, so
+        reconnect registers it again under the current one.
+
+        /remote-control on a connected session opens a menu with the cursor on Continue; the cursor is moved up to
+        "Disconnect this session" and that is chosen. When the menu does not show that option it is closed with
+        Escape. Returns the panes disconnected.
+        """
+        ctx, done = self.ctx, []
+        if not rc_wanted(cd) or ctx.now() - load_state(ctx)["switched_at"].get(cd, 0) < RC_SETTLE:
+            return done
+        for p in ctx.list_procs():
+            if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in done:
+                continue
+            info = session_info(cd, p.pid)
+            if info.get("kind") != "interactive" or info.get("status") not in PROMPT_FREE or not self.stale_bridge(cd, info):
+                continue
+            last = self.rc_sent.get(p.pid)
+            if last and ctx.now() - last < RC_RETRY or not prompt_empty(ctx.tmux_capture(p)):
+                continue
+            self.rc_sent[p.pid] = ctx.now()
+            self.type_line(p, RC_TEXT)
+            for _ in range(MENU_STEPS):
+                ctx.sleep(ESCAPE_GAP)
+                screen = ctx.tmux_capture(p)
+                if RC_DISCONNECT not in plain(screen):
+                    continue
+                if menu_cursor(screen) == RC_DISCONNECT:
+                    ctx.tmux_send(p, ["Enter"])
+                    done.append(p.pane)
+                    break
+                ctx.tmux_send(p, ["Up"])
+            else:
+                ctx.tmux_send(p, ["Escape"])
+                ctx.log("rc_disconnect_failed", config_dir=cd, pane=p.pane)
+        if done:
+            ctx.log("rc_stale_disconnected", config_dir=cd, panes=",".join(done))
+        return done
 
     def summarize(self, cd: str) -> list:
         """Ask each session of cd still owed a status summary since the last switch to write it, once its prompt is free.
@@ -980,6 +1066,7 @@ class Rotator:
                 self.recover(cd)
             self.wake(cd)
             self.dismiss_rc_dialogs(cd)
+            self.disconnect_stale(cd)
             self.reconnect(cd)
             self.summarize(cd)
         renew_due(self.ctx)

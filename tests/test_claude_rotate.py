@@ -601,3 +601,57 @@ def test_a_title_cannot_type_extra_keys_into_the_session(w, two):
 def test_a_user_given_name_is_cleaned_too():
     assert cr.clean_title("docs\nresearch\x07") == "docs research"
     assert cr.clean_title("\x1b\n ") is None
+
+
+RC_MENU_TOP = ("● done\n▔▔▔\n   Remote Control\n   This session is available in the Claude mobile app and at "
+               "https://claude.ai/code/session_019pZH.\n")
+RC_MENU_ON = {opt: RC_MENU_TOP + "".join(("   ❯ " if o == opt else "     ") + o + "\n"
+                                         for o in ("Disconnect this session", "Show QR code", "Continue"))
+              + "   Enter to select · Esc to continue\n" for opt in ("Disconnect this session", "Show QR code", "Continue")}
+
+
+def stale_session(w, cd: str, owner: str) -> None:
+    """An idle session of cd connected on bridge session_019pZH, which the transcript says owner registered."""
+    rc_session(w, cd, "idle")
+    name_session(cd, bridgeSessionId="session_019pZH")
+    write_transcript(cd, {"type": "bridge-session", "bridgeSessionId": "cse_01OTHER", "ownerAccountUuid": "uuid-a@x"},
+                     {"type": "bridge-session", "bridgeSessionId": "cse_019pZH", "ownerAccountUuid": owner})
+
+
+def test_a_bridge_registered_by_another_account_is_disconnected_from_its_menu(w, two):
+    stale_session(w, two, "uuid-amv@x")
+    screens = iter(["● done\n───\n❯ \n───\n", "● done\n───\n❯ \n───\n", RC_MENU_ON["Continue"],
+                    RC_MENU_ON["Show QR code"], RC_MENU_ON["Disconnect this session"]])
+    w.ctx.tmux_capture = lambda p: next(screens)
+    assert cr.Rotator(w.ctx).disconnect_stale(two) == ["%1"]
+    assert w.sent == RC_FREE[:3] + [("%1", ("Up",), False), ("%1", ("Up",), False), ("%1", ("Enter",), False)]
+    assert "rc_stale_disconnected" in w.ctx.out.getvalue()
+
+
+def test_a_bridge_of_the_current_account_is_left_connected(w, two):
+    stale_session(w, two, "uuid-a@x")
+    assert cr.Rotator(w.ctx).disconnect_stale(two) == []
+    assert w.sent == []
+
+
+def test_a_bridge_without_an_owner_in_the_transcript_is_left_connected(w, two):
+    rc_session(w, two, "idle")
+    name_session(two, bridgeSessionId="session_019pZH")
+    assert cr.Rotator(w.ctx).disconnect_stale(two) == []
+    assert w.sent == []
+
+
+def test_a_busy_session_on_a_stale_bridge_waits_for_its_turn_to_end(w, two):
+    stale_session(w, two, "uuid-amv@x")
+    name_session(two, status="busy")
+    assert cr.Rotator(w.ctx).disconnect_stale(two) == []
+    assert w.sent == []
+
+
+def test_a_menu_without_the_disconnect_option_is_closed(w, two):
+    stale_session(w, two, "uuid-amv@x")
+    screens = iter(["● done\n───\n❯ \n───\n"] * 2 + ["● done\n───\n❯ \n───\n"] * cr.MENU_STEPS)
+    w.ctx.tmux_capture = lambda p: next(screens)
+    assert cr.Rotator(w.ctx).disconnect_stale(two) == []
+    assert w.sent == RC_FREE[:3] + [("%1", ("Escape",), False)]
+    assert "rc_disconnect_failed" in w.ctx.out.getvalue()
