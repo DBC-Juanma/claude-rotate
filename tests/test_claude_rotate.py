@@ -71,13 +71,33 @@ class World:
         self.claude_writes = None
         self.claude_error = None
         self.screen = "● done\n───\n❯ \n───\n  status line\n"
+        self.box = {}
+        self.enter_dropped = 0
         self.ctx = cr.Ctx(root=tmp_path / "root", now=self.clock, sleep=lambda s: None,
-                          list_procs=lambda: self.procs, tmux_send=self._send, tmux_capture=lambda p: self.screen,
+                          list_procs=lambda: self.procs, tmux_send=self._send, tmux_capture=self._capture,
                           out=io.StringIO(),
                           run_claude=self._run_claude, token_email=lambda at: self.owners.get(at))
 
     def _send(self, proc, keys, literal=False):
+        """Record the keys and play them on the pane's input box: text goes in, Enter submits it (unless an Enter is
+        set to be dropped, as a session slow to draw the text does), Ctrl+U empties it."""
         self.sent.append((proc.pane, tuple(keys), literal))
+        if literal:
+            self.box[proc.pane] = self.box.get(proc.pane, "") + "".join(keys)
+        elif keys == ["Enter"] and self.enter_dropped:
+            self.enter_dropped -= 1
+        elif keys == ["Enter"] or "C-u" in keys:
+            self.box[proc.pane] = ""
+
+    def _capture(self, proc):
+        """self.screen with the pane's input box (its last ❯ line) holding what was typed and not yet sent, which
+        replaces a dim suggestion there."""
+        typed = self.box.get(proc.pane, "")
+        lines = self.screen.split("\n")
+        boxes = [i for i, ln in enumerate(lines) if ln.lstrip().startswith(("❯", "\x1b[39m❯"))]
+        if typed and boxes:
+            lines[boxes[-1]] = f"❯ {typed}"
+        return "\n".join(lines)
 
     def _run_claude(self, config_dir):
         self.claude_runs.append(json.loads((Path(config_dir) / ".claude.json").read_text())["oauthAccount"]["emailAddress"])
@@ -293,7 +313,7 @@ def test_limit_in_transcript_rotates_and_wakes_the_session(w, two):
     assert cr.current_email(two) == "b@x"
     assert w.creds(two)["claudeAiOauth"] == oauth("b1")
     assert cr.load_state(w.ctx)["limited"]["a@x"] == dt.datetime(2026, 10, 22, 21, 0, tzinfo=MADRID).timestamp()
-    assert w.sent == [("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
 
 
 
@@ -320,12 +340,11 @@ def test_a_session_stopped_by_the_limit_reconnects_by_name_and_is_woken_on_its_n
     assert rot.reconnect(two) == []
     w.clock.t += cr.RC_SETTLE
     assert rot.reconnect(two) == ["%1"]
-    assert w.sent == [("%1", ("Escape",), False), ("%1", ("/remote-control yed18-s",), True), ("%1", ("Enter",), False),
-                      ("%1", ("Escape",), False)]
+    assert w.sent == [("%1", ("/remote-control yed18-s",), True), ("%1", ("Enter",), False)]
     w.sent.clear()
     name_session(two, bridgeSessionId="session_new")
     assert rot.wake(two) == ["%1"]
-    assert w.sent == [("%1", ("Escape",), False), ("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
     w.sent.clear()
     assert rot.summarize(two) == []
 
@@ -345,7 +364,7 @@ def test_limit_from_before_the_switch_is_ignored(w, two):
     assert "limit_inflight_ignored" in w.ctx.out.getvalue()
 
 
-RC_FREE = [("%1", ("Escape",), False), ("%1", (cr.RC_TEXT,), True), ("%1", ("Enter",), False), ("%1", ("Escape",), False)]
+RC_FREE = [("%1", (cr.RC_TEXT,), True), ("%1", ("Enter",), False)]
 RC_BUSY = [("%1", (cr.RC_TEXT,), True), ("%1", ("Enter",), False)]
 
 
@@ -381,7 +400,7 @@ def test_reconnect_names_the_remote_session_after_the_name_its_user_gave_it(w, t
     name_session(two, name="docs-research", nameSource="user")
     write_transcript(two, {"type": "ai-title", "aiTitle": "Docs of the research", "sessionId": "s1"})
     assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
-    assert w.sent == [RC_FREE[0], ("%1", ("/remote-control docs-research",), True)] + RC_FREE[2:]
+    assert w.sent == [("%1", ("/remote-control docs-research",), True), RC_FREE[1]]
 
 
 def test_reconnect_uses_the_generated_title_not_the_name_derived_from_the_directory(w, two):
@@ -391,7 +410,7 @@ def test_reconnect_uses_the_generated_title_not_the_name_derived_from_the_direct
                      {"type": "user", "message": {"content": "hi"}},
                      {"type": "ai-title", "aiTitle": "Técnica flip en el QG", "sessionId": "s1"})
     assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
-    assert w.sent == [RC_FREE[0], ("%1", ("/remote-control Técnica flip en el QG",), True)] + RC_FREE[2:]
+    assert w.sent == [("%1", ("/remote-control Técnica flip en el QG",), True), RC_FREE[1]]
 
 
 def test_reconnect_without_a_title_leaves_the_remote_session_unnamed(w, two):
@@ -401,7 +420,7 @@ def test_reconnect_without_a_title_leaves_the_remote_session_unnamed(w, two):
     assert w.sent == RC_FREE
 
 
-SUMMARY = [("%1", ("Escape",), False), ("%1", (cr.SUMMARY_TEXT,), True), ("%1", ("Enter",), False)]
+SUMMARY = [("%1", (cr.SUMMARY_TEXT,), True), ("%1", ("Enter",), False)]
 
 
 def rotated_session(w, cd: str, status: str, bridge) -> cr.Rotator:
@@ -467,7 +486,7 @@ def test_a_session_stopped_by_the_limit_gets_only_the_wake_text(w, two):
     assert w.sent == []
     name_session(two, bridgeSessionId="session_new")
     assert rot.wake(two) == ["%1"]
-    assert w.sent == SUMMARY[:1] + [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
     w.sent.clear()
     assert rot.summarize(two) == []
     assert w.sent == []
@@ -525,13 +544,31 @@ def test_reconnect_skips_an_open_dialog(w, two):
     assert cr.Rotator(w.ctx).reconnect(two) == []
 
 
-def test_typing_after_escape_waits_so_the_first_character_is_not_read_as_alt(w, two):
+def test_typing_sends_no_escape_and_waits_for_the_text_before_enter(w, two):
     rc_session(w, two, "idle")
     events = []
     w.ctx.sleep = lambda secs: events.append(("sleep", secs))
-    w.ctx.tmux_send = lambda proc, keys, literal=False: events.append(tuple(keys))
-    cr.Rotator(w.ctx).type_line(w.procs[0], "Account rotated")
-    assert events == [("Escape",), ("sleep", cr.ESCAPE_GAP), ("Account rotated",), ("Enter",), ("sleep", cr.ESCAPE_GAP)]
+    send = w.ctx.tmux_send
+    w.ctx.tmux_send = lambda proc, keys, literal=False: (events.append(tuple(keys)), send(proc, keys, literal))
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], "Account rotated")
+    assert events == [("Account rotated",), ("sleep", cr.POLL), ("Enter",), ("sleep", cr.POLL)]
+
+
+def test_an_enter_the_session_drops_is_pressed_again(w, two):
+    rc_session(w, two, "idle")
+    w.enter_dropped = 1
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == SUMMARY + [("%1", ("Enter",), False)]
+    assert w.box["%1"] == ""
+
+
+def test_text_slow_to_show_is_waited_for_before_enter(w, two):
+    rc_session(w, two, "idle")
+    empty = "● done\n───\n❯ \n───\n"
+    screens = iter([empty, empty, STUCK_SUMMARY_SCREEN.replace("ccount", "Account"), empty])
+    w.ctx.tmux_capture = lambda p: next(screens)
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == SUMMARY
 
 
 RC_NOT_CONNECTED_SCREEN = ("● done\n▔▔▔\n   Remote Control\n   × Remote Control isn't connected.\n"
@@ -569,7 +606,7 @@ STUCK_SUMMARY_SCREEN = ("● done\n───\n❯ ccount rotated (claude-rotate)
 
 def test_a_line_left_in_the_input_box_gets_a_second_enter(w, two):
     rc_session(w, two, "idle")
-    screens = iter([STUCK_SUMMARY_SCREEN, "● done\n───\n❯ \n───\n"])
+    screens = iter([STUCK_SUMMARY_SCREEN] * (1 + cr.TYPE_POLLS) + ["● done\n───\n❯ \n───\n"])
     w.ctx.tmux_capture = lambda p: next(screens)
     assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
     assert w.sent == SUMMARY + [("%1", ("Enter",), False)]
@@ -579,7 +616,7 @@ def test_a_line_that_never_submits_is_cleared_not_left_as_a_draft(w, two):
     rc_session(w, two, "idle")
     w.screen = STUCK_SUMMARY_SCREEN
     assert not cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY + [("%1", ("Enter",), False), ("%1", ("C-u",), False)]
+    assert w.sent == SUMMARY + [("%1", ("Enter",), False)] * (cr.ENTER_TRIES - 1) + [("%1", tuple(cr.CLEAR_KEYS), False)]
     assert "type_failed" in w.ctx.out.getvalue()
 
 
@@ -620,9 +657,14 @@ def stale_session(w, cd: str, owner: str) -> None:
 
 def test_a_bridge_registered_by_another_account_is_disconnected_from_its_menu(w, two):
     stale_session(w, two, "uuid-amv@x")
-    screens = iter(["● done\n───\n❯ \n───\n", "● done\n───\n❯ \n───\n", RC_MENU_ON["Continue"],
-                    RC_MENU_ON["Show QR code"], RC_MENU_ON["Disconnect this session"]])
-    w.ctx.tmux_capture = lambda p: next(screens)
+    options = ["Continue", "Show QR code", "Disconnect this session"]
+
+    def screen(p):
+        keys = [k for _, k, _ in w.sent]
+        if ("Enter",) not in keys:
+            return f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+        return RC_MENU_ON[options[min(keys.count(("Up",)), 2)]]
+    w.ctx.tmux_capture = screen
     assert cr.Rotator(w.ctx).disconnect_stale(two) == ["%1"]
     assert w.sent == RC_FREE[:3] + [("%1", ("Up",), False), ("%1", ("Up",), False), ("%1", ("Enter",), False)]
     assert "rc_stale_disconnected" in w.ctx.out.getvalue()
@@ -650,10 +692,9 @@ def test_a_busy_session_on_a_stale_bridge_waits_for_its_turn_to_end(w, two):
 
 def test_a_menu_without_the_disconnect_option_is_closed(w, two):
     stale_session(w, two, "uuid-amv@x")
-    screens = iter(["● done\n───\n❯ \n───\n"] * 2 + ["● done\n───\n❯ \n───\n"] * cr.MENU_STEPS)
-    w.ctx.tmux_capture = lambda p: next(screens)
+    w.screen = "● done\n───\n❯ \n───\n"
     assert cr.Rotator(w.ctx).disconnect_stale(two) == []
-    assert w.sent == RC_FREE[:3] + [("%1", ("Escape",), False)]
+    assert w.sent == RC_FREE + [("%1", ("Escape",), False)]
     assert "rc_disconnect_failed" in w.ctx.out.getvalue()
 
 
@@ -713,3 +754,18 @@ def test_an_agent_view_with_a_draft_is_left_alone(w, two):
 def test_viewed_session_reads_the_title_above_the_input_box():
     assert cr.viewed_session(VIEW_SCREEN) == ZALO
     assert cr.viewed_session("● done\n❯ \n") is None
+
+
+def test_text_that_never_shows_is_not_submitted_and_the_box_is_cleared(w, two):
+    rc_session(w, two, "idle")
+    w.ctx.tmux_capture = lambda p: "● done\n───\n❯ \n───\n"
+    assert not cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == [SUMMARY[0], ("%1", tuple(cr.CLEAR_KEYS), False)]
+    assert "type_failed" in w.ctx.out.getvalue()
+
+
+def test_two_dropped_enters_still_submit(w, two):
+    rc_session(w, two, "idle")
+    w.enter_dropped = 2
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
+    assert w.sent == SUMMARY + [("%1", ("Enter",), False)] * 2

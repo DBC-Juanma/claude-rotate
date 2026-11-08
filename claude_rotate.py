@@ -37,7 +37,10 @@ SUMMARY_TEXT = ("Account rotated (claude-rotate) and Remote Control restarted wi
                 "for whoever follows this session remotely: what you were doing, what is done, what is pending and the next step. "
                 "Do not start any new work after it.")
 NAMED = ("user", "auto")
-ESCAPE_GAP = 0.5
+POLL = 0.5
+TYPE_POLLS = 6
+ENTER_TRIES = 4
+CLEAR_KEYS = ["C-u", "BSpace"] * (ENTER_TRIES + 2) + ["C-u"]
 TITLE_MAX = 80
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 RC_TEXT = "/remote-control"
@@ -555,6 +558,12 @@ def prompt_empty(screen: str) -> bool:
     return bool(prompts) and prompts[-1] == "❯"
 
 
+def rc_dialog_open(screen: str) -> bool:
+    """Whether a captured screen ends in a Remote Control dialog waiting on "Esc to continue"."""
+    lines = [ln.strip() for ln in plain(screen).splitlines() if ln.strip()]
+    return bool(lines) and lines[-1].endswith(RC_DIALOG[1]) and any(m in ln for ln in lines[-10:] for m in RC_DIALOG[0])
+
+
 def input_holds(screen: str, text: str) -> bool:
     """Whether the input box on a captured Claude Code screen (from its last ❯ line down) still holds the start of text."""
     lines = plain(screen).replace("\xa0", " ").splitlines()
@@ -709,25 +718,33 @@ class Rotator:
         self.old_bridge: dict = {}
         self.owners: dict = {}
 
-    def type_line(self, p: Proc, text: str, escape: bool = True) -> bool:
-        """Type text into p's input box and submit it, after an Escape that clears the box when escape is set.
+    def type_line(self, p: Proc, text: str) -> bool:
+        """Type text into p's empty input box and submit it; returns whether it was submitted.
 
-        The pause after Escape keeps the terminal from reading Escape and the first character as one Alt key. When the
-        text is still in the input box after Enter, Enter is pressed once more; if it is still there, the box is emptied
-        (Ctrl+U) so it is not left behind as a draft. Returns whether the text was submitted.
+        No Escape is sent first: it doesn't clear the box, the terminal can read it with the first letter as one Alt
+        key, and it would interrupt a busy session. Enter is pressed only once the text shows in the box, since a
+        session slow to draw it can drop an Enter that arrives before the text is in. Enter is pressed again, up to
+        ENTER_TRIES times, while the text stays in the box (a session sometimes takes an Enter as a new line instead).
+        If the text never shows, or never leaves, the box is emptied line by line (Ctrl+U, Backspace) so it is not
+        left there as a draft for the user to send.
         """
         ctx = self.ctx
-        if escape:
-            ctx.tmux_send(p, ["Escape"])
-            ctx.sleep(ESCAPE_GAP)
         ctx.tmux_send(p, [text], literal=True)
-        ctx.tmux_send(p, ["Enter"])
-        for retry in (["Enter"], ["C-u"]):
-            ctx.sleep(ESCAPE_GAP)
-            if not input_holds(ctx.tmux_capture(p), text):
-                return True
-            ctx.tmux_send(p, retry)
+        if self.wait_box(p, text, True):
+            for _ in range(ENTER_TRIES):
+                ctx.tmux_send(p, ["Enter"])
+                if self.wait_box(p, text, False):
+                    return True
+        ctx.tmux_send(p, CLEAR_KEYS)
         ctx.log("type_failed", pane=p.pane, text=text[:40])
+        return False
+
+    def wait_box(self, p: Proc, text: str, holds: bool) -> bool:
+        """Poll p's screen for up to TYPE_POLLS * POLL seconds until its input box holds text (holds) or no longer does."""
+        for _ in range(TYPE_POLLS):
+            self.ctx.sleep(POLL)
+            if input_holds(self.ctx.tmux_capture(p), text) == holds:
+                return True
         return False
 
     def rc_ready(self, cd: str, pid: int, info: dict) -> bool:
@@ -796,7 +813,7 @@ class Rotator:
             hit = entry_error(line) if line else None
             if not hit or (hit.uuid or path) in self.woken:
                 continue
-            if not self.rc_ready(cd, p.pid, session_info(cd, p.pid)):
+            if not self.rc_ready(cd, p.pid, session_info(cd, p.pid)) or not prompt_empty(ctx.tmux_capture(p)):
                 continue
             self.type_line(p, WAKE_TEXT)
             self.woken.add(hit.uuid or path)
@@ -835,16 +852,15 @@ class Rotator:
                     and any(m in plain(screen) for m in RC_BROKEN):
                 self.restart(cd, p, info)
                 continue
-            free = status in PROMPT_FREE
-            if free:
+            if status in PROMPT_FREE:
                 escape.add(p.pane)
-            self.type_line(p, rc_command(cd, info), escape=free)
+            self.type_line(p, rc_command(cd, info))
             self.rc_sent[p.pid] = ctx.now()
             sent.append(p.pane)
         if sent:
             ctx.sleep(5)
             for p in ctx.list_procs():
-                if p.pane in escape:
+                if p.pane in escape and rc_dialog_open(ctx.tmux_capture(p)):
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
         return sent
@@ -875,7 +891,7 @@ class Rotator:
             if last and ctx.now() - last < RC_RETRY:
                 continue
             title = clean_title(job["name"])
-            self.type_line(p, f"{RC_TEXT} {title}" if title else RC_TEXT, escape=False)
+            self.type_line(p, f"{RC_TEXT} {title}" if title else RC_TEXT)
             self.rc_sent[job["jobId"]] = ctx.now()
             sent.append(p.pane)
             del due[job["name"]]
@@ -920,7 +936,7 @@ class Rotator:
             self.rc_sent[p.pid] = ctx.now()
             self.type_line(p, RC_TEXT)
             for _ in range(MENU_STEPS):
-                ctx.sleep(ESCAPE_GAP)
+                ctx.sleep(POLL)
                 screen = ctx.tmux_capture(p)
                 if RC_DISCONNECT not in plain(screen):
                     continue
@@ -978,8 +994,7 @@ class Rotator:
                 continue
             if session_info(cd, p.pid).get("kind") != "interactive":
                 continue
-            lines = [ln.strip() for ln in plain(ctx.tmux_capture(p)).splitlines() if ln.strip()]
-            if not lines or not lines[-1].endswith(RC_DIALOG[1]) or not any(m in ln for ln in lines[-10:] for m in RC_DIALOG[0]):
+            if not rc_dialog_open(ctx.tmux_capture(p)):
                 continue
             seen.add(p.pane)
             if p.pane in self.rc_dialogs:
