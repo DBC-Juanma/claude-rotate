@@ -30,12 +30,12 @@ RENEW_TIMEOUT = 180
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 LIMIT_ERROR = "usage_limit_reached"
 AUTH_ERROR = "authentication_failed"
-WAKE_TEXT = ("Account rotated (claude-rotate). Before anything else, write a short status summary for whoever follows "
-             "this session remotely: what you were doing, what is done, what is pending and the next step. "
-             "Then continue where you stopped.")
-SUMMARY_TEXT = ("Account rotated (claude-rotate) and Remote Control restarted without its history. Write a short status summary "
-                "for whoever follows this session remotely: what you were doing, what is done, what is pending and the next step. "
-                "Do not start any new work after it.")
+COMPACT_TEXT = ("/compact Account rotated (claude-rotate). Keep what this session was doing, what is done, what is pending "
+                "and the next step.")
+CONTINUE_TEXT = "Account rotated (claude-rotate) and the conversation compacted. Continue where you stopped."
+ACTIVE_WINDOW = 30 * 60
+COMPACT_WAIT = 10 * 60
+COMPACT_MARK = b'"compact_boundary"'
 NAMED = ("user", "auto")
 POLL = 0.5
 TYPE_POLLS = 6
@@ -586,6 +586,11 @@ def is_idle(line: Optional[str]) -> bool:
     return bool(e.get("isApiErrorMessage")) or msg.get("stop_reason") in IDLE_STOPS
 
 
+def is_active(info: dict, now: float) -> bool:
+    """Whether a session is busy, or its status last changed (its last turn ended) within ACTIVE_WINDOW seconds."""
+    return info.get("status") == "busy" or (info.get("statusUpdatedAt") or 0) / 1000 >= now - ACTIVE_WINDOW
+
+
 def transcript_path(cd: str, sid: Optional[str]) -> Optional[str]:
     """The transcript of session sid under cd, or None."""
     found = glob.glob(os.path.join(cd, "projects", "*", f"{sid}.jsonl")) if sid else []
@@ -714,7 +719,8 @@ class Rotator:
         self.rc_restarted: dict = {}
         self.auth_hits: dict = {}
         self.rc_dialogs: set = set()
-        self.summary_due: dict = {}
+        self.compact_due: dict = {}
+        self.continue_due: dict = {}
         self.old_bridge: dict = {}
         self.owners: dict = {}
 
@@ -795,10 +801,11 @@ class Rotator:
         return hits
 
     def wake(self, cd: str) -> list:
-        """Nudge each tmux session of cd whose last turn is a limit error from before the last switch.
+        """Compact each tmux session of cd whose last turn is a limit error from before the last switch; resume tells it
+        to continue once the compaction is in its transcript.
 
-        A session that should run Remote Control waits for its new bridge (reconnect brings it up), so the status
-        summary the nudge asks for is the first thing the new remote session shows.
+        A session that should run Remote Control waits for its new bridge (reconnect brings it up), so the compaction
+        is the first thing the new remote session shows.
         """
         ctx, woken = self.ctx, []
         st = load_state(ctx)
@@ -815,9 +822,11 @@ class Rotator:
                 continue
             if not self.rc_ready(cd, p.pid, session_info(cd, p.pid)) or not prompt_empty(ctx.tmux_capture(p)):
                 continue
-            self.type_line(p, WAKE_TEXT)
+            offset = os.path.getsize(path)
+            self.type_line(p, COMPACT_TEXT)
             self.woken.add(hit.uuid or path)
-            self.summary_due.get(cd, set()).discard(p.pid)
+            self.compact_due.get(cd, set()).discard(p.pid)
+            self.continue_due.setdefault(cd, {})[p.pid] = (path, offset, ctx.now())
             woken.append(p.pane)
         if woken:
             ctx.log("woke", config_dir=cd, panes=",".join(woken))
@@ -952,14 +961,14 @@ class Rotator:
             ctx.log("rc_stale_disconnected", config_dir=cd, panes=",".join(done))
         return done
 
-    def summarize(self, cd: str) -> list:
-        """Ask each session of cd still owed a status summary since the last switch to write it, once its prompt is free.
+    def compact(self, cd: str) -> list:
+        """Run /compact in each session of cd that was active at the last switch, once its prompt is free.
 
-        A session waits while it is busy, while its new Remote Control bridge is not up yet (so the summary is the first
-        thing the remote session shows), and while its input box holds a draft or a dialog. Returns the panes asked.
+        A session waits while it is busy, while its new Remote Control bridge is not up yet (so the compaction is the
+        first thing the remote session shows), and while its input box holds a draft or a dialog. Returns the panes.
         """
         ctx, asked = self.ctx, []
-        due = self.summary_due.get(cd)
+        due = self.compact_due.get(cd)
         if not due:
             return asked
         alive = {p.pid: p for p in ctx.list_procs() if os.path.normpath(p.config_dir) == os.path.normpath(cd) and p.pane}
@@ -973,12 +982,43 @@ class Rotator:
             hit = entry_error(line) if line else None
             if hit and hit.kind == "limit" or not prompt_empty(ctx.tmux_capture(p)):
                 continue
-            self.type_line(p, SUMMARY_TEXT)
+            self.type_line(p, COMPACT_TEXT)
             due.discard(pid)
             asked.append(p.pane)
         if asked:
-            ctx.log("summary_asked", config_dir=cd, panes=",".join(asked))
+            ctx.log("compact_asked", config_dir=cd, panes=",".join(asked))
         return asked
+
+    def resume(self, cd: str) -> list:
+        """Tell each session wake compacted to continue, once its transcript holds the compaction and its prompt is free.
+
+        A compaction that has not shown up COMPACT_WAIT seconds after /compact was typed is logged and the session is
+        told to continue anyway, so a failed /compact does not leave it stopped. Returns the panes told.
+        """
+        ctx, told = self.ctx, []
+        due = self.continue_due.get(cd)
+        if not due:
+            return told
+        alive = {p.pid: p for p in ctx.list_procs() if os.path.normpath(p.config_dir) == os.path.normpath(cd) and p.pane}
+        for pid in [pid for pid in due if pid not in alive]:
+            del due[pid]
+        for pid in sorted(due):
+            p, (path, offset, sent_at) = alive[pid], due[pid]
+            if session_info(cd, pid).get("status") not in PROMPT_FREE or not prompt_empty(ctx.tmux_capture(p)):
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(offset)
+                compacted = COMPACT_MARK in fh.read()
+            if not compacted:
+                if ctx.now() - sent_at < COMPACT_WAIT:
+                    continue
+                ctx.log("compact_missing", config_dir=cd, pane=p.pane)
+            self.type_line(p, CONTINUE_TEXT)
+            del due[pid]
+            told.append(p.pane)
+        if told:
+            ctx.log("continued", config_dir=cd, panes=",".join(told))
+        return told
 
     def dismiss_rc_dialogs(self, cd: str) -> list:
         """Close a Remote Control dialog that is still open on the next tick: the one of a connected session, or the
@@ -1045,8 +1085,8 @@ class Rotator:
                 continue
             info = session_info(cd, p.pid)
             self.old_bridge[p.pid] = info.get("bridgeSessionId")
-            if info.get("kind") == "interactive":
-                self.summary_due.setdefault(cd, set()).add(p.pid)
+            if info.get("kind") == "interactive" and is_active(info, ctx.now()):
+                self.compact_due.setdefault(cd, set()).add(p.pid)
         self.baseline(cd)
         self.wake(cd)
         return True
@@ -1155,7 +1195,8 @@ class Rotator:
             self.disconnect_stale(cd)
             self.reconnect(cd)
             self.reconnect_bg(cd)
-            self.summarize(cd)
+            self.compact(cd)
+            self.resume(cd)
         renew_due(self.ctx)
 
     def run(self, interval: float) -> None:

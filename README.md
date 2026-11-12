@@ -21,7 +21,7 @@ claude-rotate keeps a **vault** with one token slot per account and runs a watch
 
 1. **Detects the limit.** It tails Claude Code's transcripts (`<config-dir>/projects/**/*.jsonl`, subagent transcripts included) for the synthetic error entry Claude Code writes when a request fails. It reads the entry's structured fields, never its text: `apiError == "usage_limit_reached"` is a usage limit and `quotaLimits.resetsAt` is when it resets; `error == "authentication_failed"` is an expired login. The account is marked limited until `resetsAt`, or for 5 hours if the entry has none. A short-lived 429 is not a quota limit and is ignored, and a reworded or translated message doesn't break detection.
 2. **Switches.** It saves the outgoing account's live tokens to its slot, then writes the next available account (round-robin, skipping limited and dead ones) into the config dir's `.credentials.json` and `.claude.json`. Every other key in those files is left alone.
-3. **Wakes sessions.** In every tmux pane whose last turn ended in that limit, it types a nudge that asks the session to write a short status summary (what it was doing, what is done, what is pending, the next step) and then continue where it stopped. The session picks up on the new account. Every other interactive session is asked for the same summary, without continuing, once its prompt is free (see [Remote Control and the status summary](#remote-control-and-the-status-summary)).
+3. **Wakes sessions.** In every tmux pane whose last turn ended in that limit, it runs `/compact` (asking the summary to keep what the session was doing, what is done, what is pending and the next step). Once the compaction shows in the transcript (a `compact_boundary` entry), it types "continue where you stopped" and the session picks up on the new account. Every other session that was active at the switch is compacted the same way, without continuing, once its prompt is free (see [Remote Control and the compaction](#remote-control-and-the-compaction)).
 4. **Files every token under its real owner.** When the live tokens change (a session refreshed them, or a session still on the old account wrote its token), it asks the OAuth profile endpoint who owns the token and stores it in that account's slot. If the token belongs to a different account than the one the config dir should be on, it puts the right tokens back. If the owner can't be resolved, for example because there's no network, it writes nothing. It never guesses.
 5. **Keeps idle accounts alive.** Every 6 hours, each enrolled account that isn't in use gets a one-word `claude -p` call. The call runs in a throwaway config dir, so the tokens refresh and get stored without touching your real one. A renewal that fails with `error == "authentication_failed"` in the throwaway dir's transcript marks the account dead; any other failure is reported as an error and retried later.
 6. **Comes back.** When every account is limited, it logs `all_limited` and waits. As soon as one is free again, it switches and wakes the sessions.
@@ -42,10 +42,10 @@ flowchart TD
     V -->|no| W
     N -->|none| A[Log all_limited and wait]
     N -->|found| SW[Switch: save outgoing tokens,<br/>write the next account]
-    SW --> M[Mark every interactive session<br/>as owed a summary; remember its old bridge]
-    M --> W[Wake sessions stopped by the limit<br/>once on a new bridge: summary + continue]
+    SW --> M[Mark every active interactive session<br/>as owed a /compact; remember its old bridge]
+    M --> W[Wake sessions stopped by the limit<br/>once on a new bridge: /compact, then continue]
     W --> RC[Reconnect Remote Control in free sessions<br/>20 s after the switch: /remote-control title]
-    RC --> SU[Ask the other sessions for the summary<br/>once free and on a new bridge]
+    RC --> SU[Compact the other active sessions<br/>once free and on a new bridge]
     SU --> RN[Renew idle accounts every 6 h]
     A --> RN
     RN --> T
@@ -68,7 +68,7 @@ stateDiagram-v2
 
 `Live` is the account a config dir is on. A limited or dead account is skipped when choosing the next one.
 
-## Remote Control and the status summary
+## Remote Control and the compaction
 
 A rotation changes the claude.ai account the machine is signed in to, so Claude Code drops every session's Remote Control bridge ("signed-in claude.ai account or organization changed"). A new bridge starts a new remote session with no history, so whoever follows the session from the phone or claude.ai would lose track of it. With `"remoteControlAtStartup": true`, claude-rotate:
 
@@ -77,7 +77,7 @@ A rotation changes the claude.ai account the machine is signed in to, so Claude 
 3. **Reaches background sessions through their agent view.** A session sent to the background (`/bg`, `claude --bg`) runs inside the Claude Code daemon with no pane of its own; the daemon keeps its bridge in `<config>/jobs/<id>/state.json` (`bridgeOwnerAccountUuid`). When that bridge is missing or belongs to another account, claude-rotate types `/remote-control <name>` into the `claude agents` view that has the session open (it reads the name on the separator line above the input box). A background session not open in any agent view can't be reached.
 4. **Keeps the session's name.** The command carries the session's title, so the remote session shows the same name: the name you gave it (`/rename`, `--name`), else the latest title Claude Code generated for it (its `ai-title` entry). The name Claude Code derives from the directory (for example `yedran-81`) is never used. Titles are cleaned before they're typed: control characters and escapes are removed, whitespace is collapsed and they're cut to 80 characters.
 5. **Moves bridges left on the old account.** Some Claude Code versions keep their bridge across the switch, so the session stays listed under the old account. Each `bridge-session` entry in the transcript names the account that registered it (`ownerAccountUuid`); when a free session's bridge belongs to another account than the one its config dir is on now, claude-rotate opens `/remote-control`, chooses "Disconnect this session", and step 2 registers it again under the current account.
-6. **Asks for a status summary on the new bridge.** Every interactive session that was running at the switch writes a short status summary, so it's the first thing the new remote session shows. A session waits until its prompt is free and its bridge is a new one (the session registry still shows the old bridge for a few seconds after the switch). Sessions stopped by the limit then continue; the rest stop after the summary.
+6. **Compacts active sessions on the new bridge.** Every interactive session that was active at the switch (busy, or its last turn ended less than 30 minutes before) gets `/compact`, so the compacted summary is the first thing the new remote session shows and the next turns don't re-read the whole context on the new account. Sessions idle for longer are left alone. A session waits until its prompt is free and its bridge is a new one (the session registry still shows the old bridge for a few seconds after the switch). Sessions stopped by the limit are then told to continue, once the compaction is in their transcript (or after 10 minutes without it, logged as `compact_missing`); the rest stop after the compaction.
 
 Everything is typed with tmux, only into an empty input box: the text, then Enter once the text shows in the box (a session slow to draw it can drop an Enter that comes first). No Escape is sent first: it doesn't clear the box, the terminal can read it with the first letter as one Alt key (the "ccount rotated" bug), and it would interrupt a busy session. While the text stays in the box, Enter is pressed again, up to four times a few seconds apart (some sessions take an Enter as a new line). If it still doesn't go, the box is emptied line by line rather than left there as a draft for you to send, and the log says `type_failed`.
 
@@ -142,7 +142,7 @@ The unit runs `~/.local/bin/claude-rotate watch`, which is where `uv tool instal
 
 Every new session starts with Remote Control on. After a rotation, claude-rotate re-runs `/remote-control` in idle sessions that lost their bridge, and restarts with `claude --resume` any session whose bridge still doesn't come up.
 
-**5. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `rc_reconnected` → `woke` / `summary_asked`, and the panes continue on their own.
+**5. Work as usual inside tmux.** When a limit hits, the log shows `limit_hit` → `switch` → `rc_reconnected` → `woke` / `compact_asked` → `continued`, and the panes continue on their own.
 
 ## Commands
 
@@ -180,9 +180,9 @@ Reorder `order` to change the rotation order. Edit the file while the watcher is
 
 - **Outside tmux nothing types "continue" for you.** The account is still switched, but a session running in a plain terminal, an IDE or the desktop app stays stopped on the limit message until you type `continue` yourself.
 - **The nudge is typed into the pane.** It waits while the input box holds a draft, but if you start typing in the same second it's sent, the two can mix. The nudge counts as a normal turn on the new account.
-- **The summary costs quota.** Every interactive session writes one after every rotation, and each one re-reads that session's whole context on the new account, often with a cold cache. With many large sessions this takes a visible bite of the new account's limit.
-- **Busy sessions write their summary late.** A busy session gets Remote Control back right away, but it writes its status summary only when its turn ends.
-- **Background sessions need an agent view open.** A session running in the background gets its Remote Control only while some `claude agents` view has it open, and it is not asked for a status summary.
+- **The compaction costs quota.** Every active session is compacted after every rotation, which reads that session's whole context once on the new account, often with a cold cache. Later turns then run on the short compacted context.
+- **Busy sessions are compacted late.** A busy session gets Remote Control back right away, but it is compacted only when its turn ends.
+- **Background sessions need an agent view open.** A session running in the background gets its Remote Control only while some `claude agents` view has it open, and it is not compacted.
 - **The generated title can be old.** A session you never named shows the title Claude Code generated for it, which can stay from an earlier topic. Give the session a name (`/rename`) to control what the remote session shows.
 - **The switch applies to the whole config dir, not to one session.** Every session sharing a `CLAUDE_CONFIG_DIR` moves to the new account together. To keep accounts apart, use separate config dirs and add each one to `config_dirs`.
 - **Never enroll the same login twice.** Two slots holding the same refresh-token family revoke each other the first time either one refreshes, and both end up logged out. Always enroll from a fresh login, never from a config dir that shares its login with another one.

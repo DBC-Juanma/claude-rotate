@@ -313,13 +313,7 @@ def test_limit_in_transcript_rotates_and_wakes_the_session(w, two):
     assert cr.current_email(two) == "b@x"
     assert w.creds(two)["claudeAiOauth"] == oauth("b1")
     assert cr.load_state(w.ctx)["limited"]["a@x"] == dt.datetime(2026, 10, 22, 21, 0, tzinfo=MADRID).timestamp()
-    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
-
-
-
-def test_wake_asks_for_a_status_summary_before_continuing():
-    assert "status summary" in cr.WAKE_TEXT
-    assert cr.WAKE_TEXT.index("summary") < cr.WAKE_TEXT.index("continue where you stopped")
+    assert w.sent == [("%1", (cr.COMPACT_TEXT,), True), ("%1", ("Enter",), False)]
 
 
 def test_a_session_stopped_by_the_limit_reconnects_by_name_and_is_woken_on_its_new_bridge(w, two):
@@ -344,9 +338,9 @@ def test_a_session_stopped_by_the_limit_reconnects_by_name_and_is_woken_on_its_n
     w.sent.clear()
     name_session(two, bridgeSessionId="session_new")
     assert rot.wake(two) == ["%1"]
-    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    assert w.sent == [("%1", (cr.COMPACT_TEXT,), True), ("%1", ("Enter",), False)]
     w.sent.clear()
-    assert rot.summarize(two) == []
+    assert rot.compact(two) == []
 
 def test_limit_from_before_the_switch_is_ignored(w, two):
     transcript = Path(two) / "projects" / "-repo" / "s1.jsonl"
@@ -420,14 +414,18 @@ def test_reconnect_without_a_title_leaves_the_remote_session_unnamed(w, two):
     assert w.sent == RC_FREE
 
 
-SUMMARY = [("%1", (cr.SUMMARY_TEXT,), True), ("%1", ("Enter",), False)]
+COMPACT = [("%1", (cr.COMPACT_TEXT,), True), ("%1", ("Enter",), False)]
+CONTINUE = [("%1", (cr.CONTINUE_TEXT,), True), ("%1", ("Enter",), False)]
+LONG_TEXT = ("Account rotated (claude-rotate) and Remote Control restarted without its history. Write a short status summary "
+             "for whoever follows this session remotely: what you were doing, what is done, what is pending and the next step.")
+TYPED = [("%1", (LONG_TEXT,), True), ("%1", ("Enter",), False)]
 
 
-def rotated_session(w, cd: str, status: str, bridge) -> cr.Rotator:
-    """A session of cd with the given status, a Rotator that just switched cd to b@x while the session was on bridge
-    session_old, and the session now on bridge."""
+def rotated_session(w, cd: str, status: str, bridge, idle_for: float = 60) -> cr.Rotator:
+    """A session of cd with the given status, last changed idle_for seconds ago, a Rotator that just switched cd to b@x
+    while the session was on bridge session_old, and the session now on bridge."""
     rc_session(w, cd, status)
-    name_session(cd, bridgeSessionId="session_old")
+    name_session(cd, bridgeSessionId="session_old", statusUpdatedAt=int((NOW - idle_for) * 1000))
     write_transcript(cd, {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}})
     rot = cr.Rotator(w.ctx)
     rot.rotate(cd)
@@ -437,64 +435,97 @@ def rotated_session(w, cd: str, status: str, bridge) -> cr.Rotator:
     return rot
 
 
-def test_the_summary_is_not_sent_on_the_bridge_that_dies_with_the_switch(w, two):
+def test_compact_is_not_sent_on_the_bridge_that_dies_with_the_switch(w, two):
     rot = rotated_session(w, two, "idle", "session_old")
-    assert rot.summarize(two) == []
+    assert rot.compact(two) == []
     assert w.sent == []
 
 
-def test_after_a_rotation_an_idle_session_writes_the_summary_once(w, two):
-    rot = rotated_session(w, two, "idle", "session_new")
-    assert rot.summarize(two) == ["%1"]
-    assert w.sent == SUMMARY
+def test_after_a_rotation_a_recently_used_session_is_compacted_once(w, two):
+    rot = rotated_session(w, two, "idle", "session_new", idle_for=cr.ACTIVE_WINDOW - 1)
+    assert rot.compact(two) == ["%1"]
+    assert w.sent == COMPACT
     w.sent.clear()
-    assert rot.summarize(two) == []
+    assert rot.compact(two) == []
     assert w.sent == []
 
 
-def test_the_summary_waits_for_the_new_remote_control_bridge(w, two):
-    rot = rotated_session(w, two, "idle", None)
-    assert rot.summarize(two) == []
-    name_session(two, bridgeSessionId="session_new")
-    assert rot.summarize(two) == ["%1"]
-    assert w.sent == SUMMARY
+def test_a_session_idle_longer_than_the_active_window_is_not_compacted(w, two):
+    rot = rotated_session(w, two, "idle", "session_new", idle_for=cr.ACTIVE_WINDOW + 1)
+    assert rot.compact(two) == []
+    assert w.sent == []
 
 
-def test_the_summary_waits_until_a_busy_session_is_idle(w, two):
-    rot = rotated_session(w, two, "busy", "session_new")
-    assert rot.summarize(two) == []
+def test_a_session_busy_at_the_switch_is_compacted_however_old_its_status(w, two):
+    rot = rotated_session(w, two, "busy", "session_new", idle_for=10 * cr.ACTIVE_WINDOW)
+    assert rot.compact(two) == []
     assert w.sent == []
     name_session(two, status="idle")
-    assert rot.summarize(two) == ["%1"]
-    assert w.sent == SUMMARY
+    assert rot.compact(two) == ["%1"]
+    assert w.sent == COMPACT
 
 
-def test_the_summary_waits_for_a_draft_in_the_input_box(w, two):
+def test_compact_waits_for_the_new_remote_control_bridge(w, two):
+    rot = rotated_session(w, two, "idle", None)
+    assert rot.compact(two) == []
+    name_session(two, bridgeSessionId="session_new")
+    assert rot.compact(two) == ["%1"]
+    assert w.sent == COMPACT
+
+
+def test_compact_waits_for_a_draft_in_the_input_box(w, two):
     rot = rotated_session(w, two, "idle", "session_new")
     w.screen = "● done\n───\n❯ lanza el benchmark ya\n───\n"
-    assert rot.summarize(two) == []
+    assert rot.compact(two) == []
     w.screen = "● done\n───\n❯ \n───\n"
-    assert rot.summarize(two) == ["%1"]
+    assert rot.compact(two) == ["%1"]
 
 
-def test_a_session_stopped_by_the_limit_gets_only_the_wake_text(w, two):
-    rc_session(w, two, "idle")
-    name_session(two, bridgeSessionId="session_old")
-    write_transcript(two, json.loads(limit_line(NOW - 100)))
+def limit_stopped_session(w, cd: str) -> cr.Rotator:
+    """A session of cd stopped by the limit, rotated, on its new bridge and woken: /compact typed into it."""
+    rc_session(w, cd, "idle")
+    name_session(cd, bridgeSessionId="session_old", statusUpdatedAt=int((NOW - 100) * 1000))
+    write_transcript(cd, json.loads(limit_line(NOW - 100)))
     rot = cr.Rotator(w.ctx)
-    rot.rotate(two)
+    rot.rotate(cd)
     assert w.sent == []
-    name_session(two, bridgeSessionId="session_new")
-    assert rot.wake(two) == ["%1"]
-    assert w.sent == [("%1", (cr.WAKE_TEXT,), True), ("%1", ("Enter",), False)]
+    name_session(cd, bridgeSessionId="session_new")
+    assert rot.wake(cd) == ["%1"]
+    assert w.sent == COMPACT
     w.sent.clear()
-    assert rot.summarize(two) == []
+    return rot
+
+
+def append_transcript(cd: str, *entries: dict) -> None:
+    with (Path(cd) / "projects" / "-repo" / "s1.jsonl").open("a") as fh:
+        fh.write("".join(json.dumps(e) + "\n" for e in entries))
+
+
+def test_a_session_stopped_by_the_limit_is_compacted_then_told_to_continue(w, two):
+    rot = limit_stopped_session(w, two)
+    assert rot.compact(two) == []
+    assert rot.resume(two) == []
+    append_transcript(two, {"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted"},
+                      {"type": "user", "isCompactSummary": True, "message": {"content": "This session is being continued"}})
+    name_session(two, status="busy")
+    assert rot.resume(two) == []
+    name_session(two, status="idle")
+    assert rot.resume(two) == ["%1"]
+    assert w.sent == CONTINUE
+    w.sent.clear()
+    assert rot.resume(two) == []
     assert w.sent == []
 
 
-def test_the_summary_text_does_not_ask_to_continue():
-    assert "status summary" in cr.SUMMARY_TEXT
-    assert "continue" not in cr.SUMMARY_TEXT.lower()
+def test_a_compaction_that_never_shows_still_lets_the_session_continue(w, two):
+    rot = limit_stopped_session(w, two)
+    w.clock.t = NOW + cr.COMPACT_WAIT - 1
+    assert rot.resume(two) == []
+    w.clock.t = NOW + cr.COMPACT_WAIT
+    assert rot.resume(two) == ["%1"]
+    assert w.sent == CONTINUE
+    assert "compact_missing" in w.ctx.out.getvalue()
+
 
 @pytest.mark.parametrize("status", ["idle", "busy"])
 def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
@@ -557,8 +588,8 @@ def test_typing_sends_no_escape_and_waits_for_the_text_before_enter(w, two):
 def test_an_enter_the_session_drops_is_pressed_again(w, two):
     rc_session(w, two, "idle")
     w.enter_dropped = 1
-    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY + [("%1", ("Enter",), False)]
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == TYPED + [("%1", ("Enter",), False)]
     assert w.box["%1"] == ""
 
 
@@ -567,8 +598,8 @@ def test_text_slow_to_show_is_waited_for_before_enter(w, two):
     empty = "● done\n───\n❯ \n───\n"
     screens = iter([empty, empty, STUCK_SUMMARY_SCREEN.replace("ccount", "Account"), empty])
     w.ctx.tmux_capture = lambda p: next(screens)
-    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == TYPED
 
 
 RC_NOT_CONNECTED_SCREEN = ("● done\n▔▔▔\n   Remote Control\n   × Remote Control isn't connected.\n"
@@ -608,21 +639,21 @@ def test_a_line_left_in_the_input_box_gets_a_second_enter(w, two):
     rc_session(w, two, "idle")
     screens = iter([STUCK_SUMMARY_SCREEN] * (1 + cr.TYPE_POLLS) + ["● done\n───\n❯ \n───\n"])
     w.ctx.tmux_capture = lambda p: next(screens)
-    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY + [("%1", ("Enter",), False)]
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == TYPED + [("%1", ("Enter",), False)]
 
 
 def test_a_line_that_never_submits_is_cleared_not_left_as_a_draft(w, two):
     rc_session(w, two, "idle")
     w.screen = STUCK_SUMMARY_SCREEN
-    assert not cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY + [("%1", ("Enter",), False)] * (cr.ENTER_TRIES - 1) + [("%1", tuple(cr.CLEAR_KEYS), False)]
+    assert not cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == TYPED + [("%1", ("Enter",), False)] * (cr.ENTER_TRIES - 1) + [("%1", tuple(cr.CLEAR_KEYS), False)]
     assert "type_failed" in w.ctx.out.getvalue()
 
 
 def test_a_submitted_line_echoed_above_the_input_box_does_not_count_as_stuck():
     screen = "❯ Account rotated (claude-rotate) and Remote Control\n● Session status\n───\n❯ \n───\n"
-    assert not cr.input_holds(screen, cr.SUMMARY_TEXT)
+    assert not cr.input_holds(screen, LONG_TEXT)
 
 
 def test_a_title_cannot_type_extra_keys_into_the_session(w, two):
@@ -759,13 +790,13 @@ def test_viewed_session_reads_the_title_above_the_input_box():
 def test_text_that_never_shows_is_not_submitted_and_the_box_is_cleared(w, two):
     rc_session(w, two, "idle")
     w.ctx.tmux_capture = lambda p: "● done\n───\n❯ \n───\n"
-    assert not cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == [SUMMARY[0], ("%1", tuple(cr.CLEAR_KEYS), False)]
+    assert not cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == [TYPED[0], ("%1", tuple(cr.CLEAR_KEYS), False)]
     assert "type_failed" in w.ctx.out.getvalue()
 
 
 def test_two_dropped_enters_still_submit(w, two):
     rc_session(w, two, "idle")
     w.enter_dropped = 2
-    assert cr.Rotator(w.ctx).type_line(w.procs[0], cr.SUMMARY_TEXT)
-    assert w.sent == SUMMARY + [("%1", ("Enter",), False)] * 2
+    assert cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
+    assert w.sent == TYPED + [("%1", ("Enter",), False)] * 2
