@@ -54,6 +54,7 @@ RC_DIALOG = (("This session is available in the Claude mobile app", "Remote Cont
 RC_SETTLE = 20
 RC_DISCONNECT = "Disconnect this session"
 RC_GRACE = 60
+RC_BACKOFF_MAX = 1800
 OWNER_RECHECK = 300
 HAND_DISCONNECT = b"<local-command-stdout>Remote Control disconnected.</local-command-stdout>"
 MENU_STEPS = 4
@@ -735,6 +736,8 @@ class Rotator:
         self.owner_checked: dict = {}
         self.rc_gone_since: dict = {}
         self.rc_connected: set = set()
+        self.rc_tries: dict = {}
+        self.stale_tried: set = set()
         self.hand_off: set = set()
         self.own_disconnects: set = set()
 
@@ -871,7 +874,8 @@ class Rotator:
         startup, on its own reconnects), so a session is typed into only once its bridge has been missing for RC_GRACE
         seconds in a row. A session whose /remote-control answered with the dialog of a connected session is not typed
         into again until its bridge shows up in the registry. A session whose user disconnected Remote Control by hand
-        is left alone until it has a bridge again.
+        is left alone until it has a bridge again. Each further send to a session whose bridge still does not show up
+        waits twice as long as the one before (RC_RETRY, then doubling up to RC_BACKOFF_MAX).
         """
         ctx, sent, escape = self.ctx, [], set()
         if not rc_wanted(cd):
@@ -886,16 +890,18 @@ class Rotator:
                 continue
             if info.get("bridgeSessionId"):
                 self.rc_gone_since.pop(p.pid, None)
+                self.rc_tries.pop(p.pid, None)
                 self.rc_connected.discard(p.pid)
-                self.hand_off.discard(transcript_path(cd, info.get("sessionId")))
+                if self.hand_off:
+                    self.hand_off.discard(transcript_path(cd, info.get("sessionId")))
                 continue
             gone = self.rc_gone_since.setdefault(p.pid, ctx.now())
             if settling or status not in RC_ANYTIME or ctx.now() - gone < RC_GRACE or p.pid in self.rc_connected:
                 continue
-            if transcript_path(cd, info.get("sessionId")) in self.hand_off:
+            if self.hand_off and transcript_path(cd, info.get("sessionId")) in self.hand_off:
                 continue
-            last = self.rc_sent.get(p.pid)
-            if last and ctx.now() - last < RC_RETRY:
+            last, tries = self.rc_sent.get(p.pid), self.rc_tries.get(p.pid, 0)
+            if last and ctx.now() - last < min(RC_RETRY * 2 ** max(tries - 1, 0), RC_BACKOFF_MAX):
                 continue
             screen = ctx.tmux_capture(p)
             if not prompt_empty(screen):
@@ -908,6 +914,7 @@ class Rotator:
                 escape.add(p.pane)
             self.type_line(p, rc_command(cd, info))
             self.rc_sent[p.pid] = ctx.now()
+            self.rc_tries[p.pid] = tries + 1
             sent.append(p.pane)
         if sent:
             ctx.sleep(5)
@@ -920,7 +927,7 @@ class Rotator:
                 connected = rc_dialog_connected(screen)
                 if connected:
                     self.rc_connected.add(p.pid)
-                ctx.log("rc_already_on", config_dir=cd, pane=p.pane, dialog="connected" if connected else "not connected")
+                ctx.log("rc_already_on", config_dir=cd, pane=p.pane, dialog="connected" if connected else "not-connected")
                 if p.pane in escape:
                     ctx.tmux_send(p, ["Escape"])
             ctx.log("rc_reconnected", config_dir=cd, panes=",".join(sent))
@@ -966,7 +973,7 @@ class Rotator:
         Older Claude Code versions keep their bridge across an account switch, so the session stays listed under the
         old account. The owner of a bridge never changes, so a known owner is read once per bridge. An owner no
         transcript entry names is read again every OWNER_RECHECK seconds; until then a bridge the session already had
-        when this daemon switched cd counts as stale, since it was registered before the switch.
+        when this daemon switched cd counts as stale, since it was registered before the switch, for one disconnect try.
         """
         key = bridge_key(info.get("bridgeSessionId"))
         account = (live_account(cd) or {}).get("accountUuid")
@@ -979,7 +986,7 @@ class Rotator:
                 self.owners[key] = owner
         if key in self.owners:
             return self.owners[key] != account
-        return info["bridgeSessionId"] == self.old_bridge.get(pid)
+        return info["bridgeSessionId"] == self.old_bridge.get(pid) and (pid, key) not in self.stale_tried
 
     def disconnect_stale(self, cd: str) -> list:
         """Disconnect the Remote Control bridge of each free session of cd whose bridge belongs to another account, so
@@ -1002,6 +1009,7 @@ class Rotator:
             if last and ctx.now() - last < RC_RETRY or not prompt_empty(ctx.tmux_capture(p)):
                 continue
             self.rc_sent[p.pid] = ctx.now()
+            self.stale_tried.add((p.pid, bridge_key(info["bridgeSessionId"])))
             self.type_line(p, RC_TEXT)
             for _ in range(MENU_STEPS):
                 ctx.sleep(POLL)
@@ -1087,7 +1095,7 @@ class Rotator:
         Either leaves the session waiting on it; Escape is its own "continue". The dialog of a connected session marks it
         so reconnect does not type into it again. Returns the panes closed.
         """
-        ctx, closed, seen = self.ctx, [], set()
+        ctx, closed, seen, kinds = self.ctx, [], set(), []
         if not rc_wanted(cd):
             return closed
         for p in ctx.list_procs():
@@ -1098,15 +1106,17 @@ class Rotator:
             screen = ctx.tmux_capture(p)
             if not rc_dialog_open(screen):
                 continue
-            if rc_dialog_connected(screen):
+            connected = rc_dialog_connected(screen)
+            if connected:
                 self.rc_connected.add(p.pid)
             seen.add(p.pane)
             if p.pane in self.rc_dialogs:
                 ctx.tmux_send(p, ["Escape"])
                 closed.append(p.pane)
+                kinds.append("connected" if connected else "not-connected")
         self.rc_dialogs = seen - set(closed)
         if closed:
-            ctx.log("rc_dialog_closed", config_dir=cd, panes=",".join(closed))
+            ctx.log("rc_dialog_closed", config_dir=cd, panes=",".join(closed), dialogs=",".join(kinds))
         return closed
 
     def restart(self, cd: str, p: Proc, info: dict) -> None:
@@ -1150,6 +1160,7 @@ class Rotator:
             info = session_info(cd, p.pid)
             self.old_bridge[p.pid] = info.get("bridgeSessionId")
             self.rc_connected.discard(p.pid)
+            self.rc_tries.pop(p.pid, None)
             if info.get("kind") == "interactive" and is_active(info, ctx.now()):
                 self.compact_due.setdefault(cd, set()).add(p.pid)
         self.baseline(cd)

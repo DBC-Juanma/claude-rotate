@@ -831,9 +831,10 @@ def test_a_bridge_missing_for_less_than_the_grace_period_is_not_typed_into(w, tw
 
 
 def answers_with(w, dialog: str) -> None:
-    """The pane shows an empty prompt with what was typed in it until Enter is pressed, then dialog."""
+    """The pane shows an empty prompt with what was typed in it, and dialog from an Enter until the next Escape."""
     def screen(p):
-        if ("Enter",) in [k for _, k, _ in w.sent]:
+        keys = [k for _, k, literal in w.sent if not literal]
+        if keys and keys[-1] == ("Enter",):
             return dialog
         return f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
     w.ctx.tmux_capture = screen
@@ -862,12 +863,11 @@ def test_a_session_whose_remote_control_answers_not_connected_is_retried(w, two)
     answers_with(w, RC_NOT_CONNECTED_SCREEN)
     rot = cr.Rotator(w.ctx)
     assert reconnect_after_grace(w, two, rot) == ["%1"]
-    assert "dialog=not connected" in w.ctx.out.getvalue()
+    assert "dialog=not-connected" in w.ctx.out.getvalue()
     w.sent.clear()
-    w.ctx.tmux_capture = lambda p: f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
     w.clock.t += cr.RC_RETRY
     assert rot.reconnect(two) == ["%1"]
-    assert w.sent == RC_FREE
+    assert w.sent[:2] == RC_FREE
 
 
 HAND_DISCONNECTED = {"type": "system", "subtype": "local_command", "level": "info", "sessionId": "s1",
@@ -948,3 +948,49 @@ def test_a_new_bridge_with_no_known_owner_is_left_connected_and_its_owner_read_a
                                     else f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n")
     w.clock.t += 1
     assert rot.disconnect_stale(two) == ["%1"]
+
+
+@pytest.mark.parametrize("dialog", [None, RC_NOT_CONNECTED_SCREEN])
+def test_a_session_whose_bridge_never_shows_up_is_retried_ever_more_rarely(w, two, dialog):
+    rc_session(w, two, "busy")
+    if dialog:
+        answers_with(w, dialog)
+    rot = cr.Rotator(w.ctx)
+    sends = []
+    for _ in range(36 * 3600 // 15):
+        rot.dismiss_rc_dialogs(two)
+        sends += rot.reconnect(two)
+        w.clock.t += 15
+    assert len(sends) == 77
+    w.ctx.tmux_capture = lambda p: f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+    name_session(two, bridgeSessionId="session_01EcKzGy")
+    rot.reconnect(two)
+    name_session(two, bridgeSessionId=None)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+    w.clock.t += cr.RC_RETRY
+    assert rot.reconnect(two) == ["%1"]
+
+
+def test_a_connected_dialog_closed_on_the_next_tick_stops_further_sends(w, two):
+    rc_session(w, two, "busy")
+    rot = cr.Rotator(w.ctx)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+    w.screen = RC_DIALOG_SCREEN
+    rot.dismiss_rc_dialogs(two)
+    assert rot.dismiss_rc_dialogs(two) == ["%1"]
+    assert "dialogs=connected" in w.ctx.out.getvalue()
+    w.screen = "● done\n───\n❯ \n───\n"
+    w.clock.t += 100 * cr.RC_BACKOFF_MAX
+    assert rot.reconnect(two) == []
+
+
+def test_a_bridge_from_before_the_switch_with_no_known_owner_gets_one_disconnect_try(w, two):
+    rot = rotated_session(w, two, "idle", "session_old")
+    w.clock.t += cr.RC_SETTLE
+    w.screen = "● done\n───\n❯ \n───\n"
+    assert rot.disconnect_stale(two) == []
+    assert "rc_disconnect_failed" in w.ctx.out.getvalue()
+    w.sent.clear()
+    w.clock.t += 10 * cr.RC_RETRY
+    assert rot.disconnect_stale(two) == []
+    assert w.sent == []
