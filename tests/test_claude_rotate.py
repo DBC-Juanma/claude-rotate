@@ -332,7 +332,7 @@ def test_a_session_stopped_by_the_limit_reconnects_by_name_and_is_woken_on_its_n
     name_session(two, bridgeSessionId=None)
     assert rot.wake(two) == []
     assert rot.reconnect(two) == []
-    w.clock.t += cr.RC_SETTLE
+    w.clock.t += cr.RC_GRACE
     assert rot.reconnect(two) == ["%1"]
     assert w.sent == [("%1", ("/remote-control yed18-s",), True), ("%1", ("Enter",), False)]
     w.sent.clear()
@@ -370,10 +370,18 @@ def rc_session(w, cd: str, status: str) -> None:
     w.procs = [cr.Proc(4242, cd, "%1", None)]
 
 
+def reconnect_after_grace(w, cd: str, rot=None) -> list:
+    """Run reconnect on a session first seen without a bridge RC_GRACE seconds ago; returns the panes typed into."""
+    rot = rot or cr.Rotator(w.ctx)
+    assert rot.reconnect(cd) == []
+    w.clock.t += cr.RC_GRACE
+    return rot.reconnect(cd)
+
+
 @pytest.mark.parametrize("status,keys", [("idle", RC_FREE), ("shell", RC_FREE), ("busy", RC_BUSY), ("waiting", [])])
 def test_reconnect_runs_remote_control_in_every_session_without_bridge(w, two, status, keys):
     rc_session(w, two, status)
-    assert cr.Rotator(w.ctx).reconnect(two) == (["%1"] if keys else [])
+    assert reconnect_after_grace(w, two) == (["%1"] if keys else [])
     assert w.sent == keys
 
 
@@ -393,7 +401,7 @@ def test_reconnect_names_the_remote_session_after_the_name_its_user_gave_it(w, t
     rc_session(w, two, "idle")
     name_session(two, name="docs-research", nameSource="user")
     write_transcript(two, {"type": "ai-title", "aiTitle": "Docs of the research", "sessionId": "s1"})
-    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert reconnect_after_grace(w, two) == ["%1"]
     assert w.sent == [("%1", ("/remote-control docs-research",), True), RC_FREE[1]]
 
 
@@ -403,14 +411,14 @@ def test_reconnect_uses_the_generated_title_not_the_name_derived_from_the_direct
     write_transcript(two, {"type": "ai-title", "aiTitle": "Propuesta calma your sock", "sessionId": "s1"},
                      {"type": "user", "message": {"content": "hi"}},
                      {"type": "ai-title", "aiTitle": "Técnica flip en el QG", "sessionId": "s1"})
-    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert reconnect_after_grace(w, two) == ["%1"]
     assert w.sent == [("%1", ("/remote-control Técnica flip en el QG",), True), RC_FREE[1]]
 
 
 def test_reconnect_without_a_title_leaves_the_remote_session_unnamed(w, two):
     rc_session(w, two, "idle")
     name_session(two, name="vokoban-de", nameSource="derived")
-    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert reconnect_after_grace(w, two) == ["%1"]
     assert w.sent == RC_FREE
 
 
@@ -538,7 +546,7 @@ def test_reconnect_leaves_a_draft_in_the_input_box_alone(w, two, status):
 def test_reconnect_types_over_a_dim_suggestion(w, two):
     rc_session(w, two, "idle")
     w.screen = "───\n\x1b[39m❯\xa0\x1b[2mlanza el benchmark ya\x1b[0m\n───\n"
-    assert cr.Rotator(w.ctx).reconnect(two) == ["%1"]
+    assert reconnect_after_grace(w, two) == ["%1"]
     assert w.sent == RC_FREE
 
 
@@ -622,6 +630,9 @@ def test_the_remote_control_not_connected_dialog_is_closed_on_the_next_tick(w, t
 def test_reconnect_waits_for_the_old_bridge_to_switch_off_after_a_switch(w, two):
     rc_session(w, two, "idle")
     rot = cr.Rotator(w.ctx)
+    w.clock.t = NOW - cr.RC_GRACE
+    assert rot.reconnect(two) == []
+    w.clock.t = NOW
     cr.switch(w.ctx, two, "b@x")
     w.clock.t = NOW + cr.RC_SETTLE - 1
     assert rot.reconnect(two) == []
@@ -800,3 +811,140 @@ def test_two_dropped_enters_still_submit(w, two):
     w.enter_dropped = 2
     assert cr.Rotator(w.ctx).type_line(w.procs[0], LONG_TEXT)
     assert w.sent == TYPED + [("%1", ("Enter",), False)] * 2
+
+
+def test_a_bridge_missing_for_less_than_the_grace_period_is_not_typed_into(w, two):
+    rc_session(w, two, "busy")
+    rot = cr.Rotator(w.ctx)
+    assert rot.reconnect(two) == []
+    w.clock.t += cr.RC_GRACE - 1
+    assert rot.reconnect(two) == []
+    name_session(two, bridgeSessionId="session_01EcKzGy")
+    assert rot.reconnect(two) == []
+    name_session(two, bridgeSessionId=None)
+    assert rot.reconnect(two) == []
+    w.clock.t += cr.RC_GRACE - 1
+    assert rot.reconnect(two) == []
+    assert w.sent == []
+    w.clock.t += 1
+    assert rot.reconnect(two) == ["%1"]
+
+
+def answers_with(w, dialog: str) -> None:
+    """The pane shows an empty prompt with what was typed in it until Enter is pressed, then dialog."""
+    def screen(p):
+        if ("Enter",) in [k for _, k, _ in w.sent]:
+            return dialog
+        return f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+    w.ctx.tmux_capture = screen
+
+
+def test_a_session_whose_remote_control_answers_connected_is_not_typed_into_again(w, two):
+    rc_session(w, two, "idle")
+    answers_with(w, RC_DIALOG_SCREEN)
+    rot = cr.Rotator(w.ctx)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+    assert w.sent == RC_FREE + [("%1", ("Escape",), False)]
+    assert "rc_already_on config_dir=" in w.ctx.out.getvalue() and "dialog=connected" in w.ctx.out.getvalue()
+    w.sent.clear()
+    w.ctx.tmux_capture = lambda p: f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+    w.clock.t += 10 * cr.RC_RETRY
+    assert rot.reconnect(two) == []
+    assert w.sent == []
+    name_session(two, bridgeSessionId="session_01EcKzGy")
+    assert rot.reconnect(two) == []
+    name_session(two, bridgeSessionId=None)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+
+
+def test_a_session_whose_remote_control_answers_not_connected_is_retried(w, two):
+    rc_session(w, two, "idle")
+    answers_with(w, RC_NOT_CONNECTED_SCREEN)
+    rot = cr.Rotator(w.ctx)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+    assert "dialog=not connected" in w.ctx.out.getvalue()
+    w.sent.clear()
+    w.ctx.tmux_capture = lambda p: f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+    w.clock.t += cr.RC_RETRY
+    assert rot.reconnect(two) == ["%1"]
+    assert w.sent == RC_FREE
+
+
+HAND_DISCONNECTED = {"type": "system", "subtype": "local_command", "level": "info", "sessionId": "s1",
+                     "content": "<local-command-stdout>Remote Control disconnected.</local-command-stdout>",
+                     "commandRun": {"command": "remote-control", "args": ""}}
+
+
+def test_a_session_disconnected_by_hand_is_not_reconnected_until_it_has_a_bridge_again(w, two):
+    rc_session(w, two, "idle")
+    write_transcript(two, {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}})
+    rot = cr.Rotator(w.ctx)
+    rot.scan_limits(two)
+    append_transcript(two, HAND_DISCONNECTED)
+    rot.scan_limits(two)
+    assert "rc_disconnected_by_hand" in w.ctx.out.getvalue()
+    assert reconnect_after_grace(w, two, rot) == []
+    w.clock.t += 100 * cr.RC_GRACE
+    assert rot.reconnect(two) == []
+    assert w.sent == []
+    name_session(two, bridgeSessionId="session_01EcKzGy")
+    assert rot.reconnect(two) == []
+    name_session(two, bridgeSessionId=None)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+
+
+def test_the_login_message_about_remote_control_is_not_a_disconnect_by_hand(w, two):
+    rc_session(w, two, "idle")
+    write_transcript(two, {"type": "assistant", "message": {"stop_reason": "end_turn", "content": []}})
+    rot = cr.Rotator(w.ctx)
+    rot.scan_limits(two)
+    append_transcript(two, {"type": "user", "message": {"role": "user", "content":
+                            "<local-command-stdout>Login successful. Remote Control disconnected.</local-command-stdout>"}},
+                      {"type": "system", "subtype": "informational", "content": "Remote Control disconnected — signed-in "
+                       "claude.ai account or organization changed on this machine — run /remote-control"})
+    rot.scan_limits(two)
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+
+
+def test_a_stale_bridge_disconnected_by_the_daemon_is_reconnected(w, two):
+    stale_session(w, two, "uuid-amv@x")
+    options = ["Continue", "Show QR code", "Disconnect this session"]
+
+    def screen(p):
+        keys = [k for _, k, _ in w.sent]
+        if ("Enter",) not in keys:
+            return f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+        return RC_MENU_ON[options[min(keys.count(("Up",)), 2)]]
+    w.ctx.tmux_capture = screen
+    rot = cr.Rotator(w.ctx)
+    rot.scan_limits(two)
+    assert rot.disconnect_stale(two) == ["%1"]
+    append_transcript(two, HAND_DISCONNECTED)
+    rot.scan_limits(two)
+    assert "rc_disconnected_by_hand" not in w.ctx.out.getvalue()
+    w.ctx.tmux_capture = lambda p: f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n"
+    name_session(two, bridgeSessionId=None)
+    w.clock.t += cr.RC_RETRY
+    assert reconnect_after_grace(w, two, rot) == ["%1"]
+
+
+def test_a_bridge_from_before_the_switch_with_no_known_owner_is_disconnected(w, two):
+    rot = rotated_session(w, two, "idle", "session_old")
+    w.clock.t += cr.RC_SETTLE
+    w.ctx.tmux_capture = lambda p: (RC_MENU_ON["Disconnect this session"] if ("Enter",) in [k for _, k, _ in w.sent]
+                                    else f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n")
+    assert rot.disconnect_stale(two) == ["%1"]
+
+
+def test_a_new_bridge_with_no_known_owner_is_left_connected_and_its_owner_read_again_later(w, two):
+    rot = rotated_session(w, two, "idle", "session_019pZH")
+    w.clock.t += cr.RC_SETTLE
+    assert rot.disconnect_stale(two) == []
+    append_transcript(two, {"type": "bridge-session", "bridgeSessionId": "cse_019pZH", "ownerAccountUuid": "uuid-a@x"})
+    w.clock.t += cr.OWNER_RECHECK - 1
+    assert rot.disconnect_stale(two) == []
+    assert w.sent == []
+    w.ctx.tmux_capture = lambda p: (RC_MENU_ON["Disconnect this session"] if ("Enter",) in [k for _, k, _ in w.sent]
+                                    else f"● done\n───\n❯ {w.box.get('%1', '')}\n───\n")
+    w.clock.t += 1
+    assert rot.disconnect_stale(two) == ["%1"]
