@@ -830,24 +830,29 @@ class Rotator:
             self.ctx.log("rc_disconnected_by_hand", transcript=path)
 
     def wake(self, cd: str) -> list:
-        """Compact each tmux session of cd whose last turn is a limit error from before the last switch; resume tells it
-        to continue once the compaction is in its transcript.
+        """Compact each tmux session of cd whose last turn is a usage-limit error that is resolved, while cd is on a
+        healthy account; resume tells it to continue once the compaction is in its transcript.
 
-        A session that should run Remote Control waits for its new bridge (reconnect brings it up), so the compaction
-        is the first thing the new remote session shows.
+        A limit error is resolved when cd switched after it (on_limit's in-flight grace included) or when the limit it
+        reports has reset. Any other error, such as a failed login, gets nothing. A session already waiting for resume
+        is not compacted again. A session that should run Remote Control waits for its new bridge (reconnect brings it
+        up), so the compaction is the first thing the new remote session shows.
         """
         ctx, woken = self.ctx, []
         st = load_state(ctx)
         cur = current_email(cd)
-        if not cur or is_limited(st, cur, ctx.now()):
+        if not cur or is_limited(st, cur, ctx.now()) or is_dead(st, cur):
             return woken
+        switched, pending = st["switched_at"].get(cd, 0), self.continue_due.get(cd, {})
         for p in ctx.list_procs():
-            if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in woken:
+            if os.path.normpath(p.config_dir) != os.path.normpath(cd) or not p.pane or p.pane in woken or p.pid in pending:
                 continue
             path = session_transcript(cd, p.pid)
             line = last_turn_entry(path) if path else None
             hit = entry_error(line) if line else None
-            if not hit or (hit.uuid or path) in self.woken:
+            if not hit or hit.kind != "limit" or (hit.uuid or path) in self.woken:
+                continue
+            if not (hit.ts is not None and hit.ts <= switched + INFLIGHT_GRACE or hit.resets and hit.resets <= ctx.now()):
                 continue
             if not self.rc_ready(cd, p.pid, session_info(cd, p.pid)) or not prompt_empty(ctx.tmux_capture(p)):
                 continue

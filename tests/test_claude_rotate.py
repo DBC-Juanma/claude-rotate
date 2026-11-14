@@ -994,3 +994,86 @@ def test_a_bridge_from_before_the_switch_with_no_known_owner_gets_one_disconnect
     w.clock.t += 10 * cr.RC_RETRY
     assert rot.disconnect_stale(two) == []
     assert w.sent == []
+
+
+def stopped_session(w, cd: str, *lines: str) -> cr.Rotator:
+    """An idle session of cd whose transcript is lines, and a Rotator that has already baselined cd."""
+    (Path(cd) / "sessions").mkdir()
+    (Path(cd) / "sessions" / "4242.json").write_text(json.dumps({"sessionId": "s1", "kind": "interactive", "status": "idle"}))
+    write_transcript(cd, *(json.loads(ln) for ln in lines))
+    w.procs = [cr.Proc(4242, cd, "%1", None)]
+    rot = cr.Rotator(w.ctx)
+    rot.tick()
+    return rot
+
+
+def test_a_login_error_with_no_account_to_rotate_to_gets_no_compact_nor_continue(w, two):
+    st = cr.load_state(w.ctx)
+    st["limited"]["b@x"] = RESET
+    cr.save_state(w.ctx, st)
+    rot = stopped_session(w, two, json.dumps({"type": "user", "message": {"content": "hi"}}))
+    append_transcript(two, json.loads(auth_line(NOW + 100, "u-403-a")))
+    w.clock.t = NOW + 120
+    rot.tick()
+    assert cr.is_dead(cr.load_state(w.ctx), "a@x")
+    assert "all_limited" in w.ctx.out.getvalue()
+    st = cr.load_state(w.ctx)
+    st["dead"].pop("a@x")
+    cr.save_state(w.ctx, st)
+    rot.tick()
+    append_transcript(two, json.loads(auth_line(NOW + 150, "u-403-b")))
+    w.clock.t = NOW + 180
+    rot.tick()
+    w.clock.t = NOW + cr.COMPACT_WAIT + 200
+    rot.tick()
+    assert w.sent == []
+    assert "woke" not in w.ctx.out.getvalue()
+
+
+def test_a_limit_resolved_by_a_rotation_is_compacted_once_then_told_to_continue(w, two):
+    rot = stopped_session(w, two, json.dumps({"type": "user", "message": {"content": "hi"}}))
+    append_transcript(two, json.loads(limit_line(NOW + 100)))
+    w.clock.t = NOW + 120
+    rot.tick()
+    assert cr.current_email(two) == "b@x"
+    assert w.sent == COMPACT
+    w.sent.clear()
+    append_transcript(two, json.loads(limit_line(NOW + 125, uuid="u-limit-inflight")))
+    w.clock.t = NOW + 150
+    rot.tick()
+    assert w.sent == []
+    append_transcript(two, {"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted"},
+                      {"type": "user", "isCompactSummary": True, "message": {"content": "This session is being continued"}})
+    w.clock.t = NOW + 200
+    rot.tick()
+    assert w.sent == CONTINUE
+    w.sent.clear()
+    w.clock.t = NOW + 300
+    rot.tick()
+    assert w.sent == []
+
+
+def test_a_limit_from_after_the_last_switch_is_not_compacted_until_resolved(w, two):
+    rot = stopped_session(w, two)
+    cr.switch(w.ctx, two, "b@x")
+    append_transcript(two, json.loads(limit_line(NOW + cr.INFLIGHT_GRACE + 10)))
+    w.clock.t = NOW + cr.INFLIGHT_GRACE + 20
+    assert rot.wake(two) == []
+    assert w.sent == []
+
+
+def test_a_limit_of_the_same_account_is_compacted_once_it_resets(w, two):
+    st = cr.load_state(w.ctx)
+    st["limited"]["b@x"] = RESET + 3600
+    cr.save_state(w.ctx, st)
+    rot = stopped_session(w, two, json.dumps({"type": "user", "message": {"content": "hi"}}))
+    append_transcript(two, json.loads(limit_line(NOW + 100)))
+    w.clock.t = NOW + 120
+    rot.tick()
+    assert cr.current_email(two) == "a@x"
+    w.clock.t = RESET - 1
+    rot.tick()
+    assert w.sent == []
+    w.clock.t = RESET
+    rot.tick()
+    assert w.sent == COMPACT
