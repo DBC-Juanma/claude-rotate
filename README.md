@@ -89,6 +89,21 @@ Everything is typed with tmux, only into an empty input box: the text, then Ente
 - **Claude Code logged in with a claude.ai subscription (OAuth)**, which stores credentials in `<config-dir>/.credentials.json`. API-key logins have nothing to rotate.
 - Network access to `api.anthropic.com` for the ownership check.
 
+System packages (`uv` or `pipx` is only the installer; the systemd user service is optional):
+
+```bash
+# Debian / Ubuntu
+sudo apt install python3 tmux procps pipx
+
+# Fedora
+sudo dnf install python3 tmux procps-ng pipx
+
+# Arch
+sudo pacman -S python tmux procps-ng python-pipx
+```
+
+macOS and Windows are not supported (see Caveats).
+
 ## Install
 
 ```bash
