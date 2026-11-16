@@ -206,12 +206,6 @@ rm -rf ~/.config/claude-rotate           # deletes the vault (all stored tokens)
 
 Your config dirs stay logged in to whichever account was live at that moment.
 
-## Development
-
-```bash
-uv run pytest
-```
-
 ## License
 
 MIT
