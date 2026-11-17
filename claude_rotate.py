@@ -648,7 +648,7 @@ def clean_title(title) -> Optional[str]:
 def session_title(cd: str, info: dict) -> Optional[str]:
     """The name a session shows: the one its user gave it, else the latest title Claude Code generated for it, else None.
 
-    The name Claude Code derives from the directory (nameSource "derived", e.g. yedran-81) is never returned.
+    The name Claude Code derives from the directory (nameSource "derived", e.g. myproject-81) is never returned.
     """
     if info.get("nameSource") in NAMED and clean_title(info.get("name")):
         return clean_title(info["name"])
