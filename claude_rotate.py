@@ -47,6 +47,9 @@ RC_TEXT = "/remote-control"
 RC_RETRY = 30
 PROMPT_FREE = ("idle", "shell")
 RC_ANYTIME = PROMPT_FREE + ("busy",)
+ORCA_PREFIX = "orca:"
+ORCA_TIMEOUT = 20
+ORCA_KEYS = {"Enter": "\r", "Escape": "\x1b", "Up": "\x1b[A", "Down": "\x1b[B", "C-u": "\x15", "BSpace": "\x7f"}
 SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 DIM_RE = re.compile(r"\x1b\[2m.*?(?=\x1b\[(?:0|22)?m|$)")
 RC_BROKEN = ("requires a claude.ai subscription", "Unknown command: /remote-control")
@@ -69,10 +72,11 @@ class Proc(NamedTuple):
     config_dir: str
     pane: Optional[str]
     tmux_socket: Optional[str]
+    orca_cli: Optional[str] = None
 
 
 def real_list_procs() -> list:
-    """Return every running `claude` process as Proc(pid, config_dir, pane, tmux_socket)."""
+    """Return every running `claude` process as Proc; pane is its tmux pane, else `orca:<handle>` of its Orca terminal."""
     out = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True).stdout.split()
     procs = []
     for pid in out:
@@ -83,8 +87,24 @@ def real_list_procs() -> list:
         env = dict(p.split("=", 1) for p in raw.decode(errors="replace").split("\0") if "=" in p)
         cd = env.get("CLAUDE_CONFIG_DIR") or DEFAULT_CONFIG_DIR
         tmux = env.get("TMUX", "")
-        procs.append(Proc(int(pid), os.path.normpath(cd), env.get("TMUX_PANE"), tmux.split(",")[0] or None))
+        if env.get("TMUX_PANE"):
+            procs.append(Proc(int(pid), os.path.normpath(cd), env["TMUX_PANE"], tmux.split(",")[0] or None))
+        elif env.get("ORCA_TERMINAL_HANDLE") and env.get("ORCA_CLI_COMMAND"):
+            pane = ORCA_PREFIX + env["ORCA_TERMINAL_HANDLE"]
+            procs.append(Proc(int(pid), os.path.normpath(cd), pane, None, env["ORCA_CLI_COMMAND"]))
+        else:
+            procs.append(Proc(int(pid), os.path.normpath(cd), None, None))
     return procs
+
+
+def _orca(proc: Proc, *args) -> dict:
+    """Run the Orca CLI against proc's terminal with args; returns its JSON result, {} when it fails."""
+    cmd = [proc.orca_cli, "terminal", *args, "--terminal", proc.pane.removeprefix(ORCA_PREFIX), "--json"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=ORCA_TIMEOUT)
+    try:
+        return json.loads(r.stdout).get("result") or {}
+    except ValueError:
+        return {}
 
 
 def _tmux(proc: Proc, *args) -> str:
@@ -93,12 +113,22 @@ def _tmux(proc: Proc, *args) -> str:
 
 
 def real_tmux_send(proc: Proc, keys: list, literal: bool = False) -> None:
-    """Send keys (or literal text) to the proc's tmux pane."""
+    """Send keys (tmux key names, or literal text) to the proc's tmux pane or Orca terminal."""
+    if proc.orca_cli:
+        _orca(proc, "send", "--text", "".join(keys if literal else (ORCA_KEYS[k] for k in keys)))
+        return
     _tmux(proc, "send-keys", "-t", proc.pane, *(["-l"] if literal else []), *keys)
 
 
 def real_tmux_capture(proc: Proc) -> str:
-    """Return the visible screen of the proc's tmux pane, with its SGR escape codes."""
+    """Return the visible screen of the proc's tmux pane (with SGR codes) or Orca terminal (its input box from `draft`)."""
+    if proc.orca_cli:
+        terminal = _orca(proc, "read", "--screen").get("terminal", {})
+        lines = list(terminal.get("tail") or [])
+        boxes = [i for i, ln in enumerate(lines) if i and ln.strip().startswith("❯") and lines[i - 1].strip().startswith("─")]
+        if boxes:
+            lines[boxes[-1]] = ("❯ " + (terminal.get("draft") or "")).rstrip()
+        return "\n".join(lines)
     return _tmux(proc, "capture-pane", "-p", "-e", "-t", proc.pane)
 
 
