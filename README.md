@@ -45,7 +45,7 @@ flowchart TD
     T(["tick, every 15 s"]) --> R["Reconcile: file live tokens<br/>under their real owner"]
     R --> S["Scan new transcript lines"]
     S --> D{"Live login dead?"}
-    D -->|yes| DD["Mark account dead"] --> SW
+    D -->|yes| DD["Mark account dead"] --> N
     D -->|no| L{"New usage limit?"}
     L -->|yes| LM["Mark account limited<br/>until resetsAt, or 5 h"] --> N
     L -->|no| RV{"Current account limited<br/>and another one free?"}
@@ -87,7 +87,7 @@ It reads the entry's structured fields, never its text:
 
 A reworded or translated message does not break detection. A short-lived 429 is not a quota limit and is ignored.
 
-The account is marked limited until `resetsAt`, or for 5 hours if the entry has none. Limit and login errors dated within 90 seconds after a switch are requests that were already in flight; they are ignored (`limit_inflight_ignored`).
+The account is marked limited until `resetsAt`, or for 5 hours if the entry has none. Limit and login errors dated within 90 seconds after a switch come from requests that were already in flight. They are ignored; for limit errors the log says `limit_inflight_ignored`.
 
 When the watcher starts, or a config dir is added, it skips everything already in the transcripts. It reacts only to new lines.
 
@@ -100,7 +100,7 @@ A switch picks the next account in `order` (round-robin), skipping accounts that
 3. Writes the target's `oauthAccount` into `.claude.json`. For the default `~/.claude` that file is `~/.claude.json`; for any other config dir it is `<config-dir>/.claude.json`.
 4. Every other key in those files is left alone.
 
-The switch applies to the whole config dir. Every session on it moves to the new account at its next request.
+The switch applies to the whole config dir, so every session on it moves together. A session that still holds the old account and writes its tokens back is handled by reconcile.
 
 When every account is limited, it logs `all_limited` with the earliest reset and waits. As soon as one is free, `recover` switches to it and the sessions are woken.
 
@@ -110,7 +110,7 @@ An account that sits unused can expire. Every 6 hours, each enrolled account tha
 
 - Success: `renewed` with the new expiry.
 - The throwaway transcript shows `error == "authentication_failed"`: the account is marked dead (`account_dead`).
-- Anything else (timeout, no `claude` binary, network): `renew_error`, retried at the next due time.
+- Anything else (timeout, no `claude` binary, network): `renew_error`. The last-renewal time is only set on success, so a failing account is retried on every tick until it works.
 
 ### Waking stopped sessions
 
@@ -184,7 +184,7 @@ All typing goes into an empty input box only:
 3. While the text stays in the box, press Enter again, up to 4 times.
 4. If it never shows or never leaves, empty the box line by line (Ctrl+U, Backspace) and log `type_failed`. It is never left behind as a draft for you to send by accident.
 
-**Sessions with neither** (a plain terminal, an IDE, the desktop app) can't be typed into. For them, the switch itself still works: they share the config dir's credentials, so their next request runs on the new account, and token reconcile, limit detection and renewal work as usual. Nothing wakes, compacts or reconnects them. Type `continue` yourself after a switch, and run `/remote-control` yourself if you use it.
+**Sessions with neither** (a plain terminal, an IDE, the desktop app) can't be typed into. For them, the switch itself still works: it rewrites the config dir's credentials they share, and token reconcile, limit detection and renewal work as usual. Nothing wakes, compacts or reconnects them. Type `continue` yourself after a switch, and run `/remote-control` yourself if you use it.
 
 ### The state of an account
 
@@ -234,7 +234,7 @@ Copy the single file onto your `PATH`:
 
 ```bash
 git clone https://github.com/DBC-Juanma/claude-rotate
-install -m 755 claude-rotate/claude_rotate.py ~/.local/bin/claude-rotate
+install -Dm 755 claude-rotate/claude_rotate.py ~/.local/bin/claude-rotate
 ```
 
 Or install it as a tool:
@@ -244,6 +244,8 @@ uv tool install git+https://github.com/DBC-Juanma/claude-rotate
 # or
 pipx install git+https://github.com/DBC-Juanma/claude-rotate
 ```
+
+From a clone: `uv tool install .`
 
 Then add the systemd user unit. It is `contrib/claude-rotate.service`:
 
@@ -261,10 +263,14 @@ RestartSec=5
 WantedBy=default.target
 ```
 
+Save it as `~/.config/systemd/user/claude-rotate.service`. From a clone:
+
 ```bash
 mkdir -p ~/.config/systemd/user
 cp claude-rotate/contrib/claude-rotate.service ~/.config/systemd/user/
 ```
+
+Without a clone, paste the unit above into that file.
 
 `ExecStart` points at `~/.local/bin/claude-rotate`, where the copy, `uv tool install` and pipx put it. Edit it if yours is elsewhere.
 
@@ -280,7 +286,7 @@ Each account needs a vault slot. `enroll` checks with the OAuth profile endpoint
 
 ```bash
 claude-rotate login                         # opens the browser login
-claude-rotate login --email you@example.com # pre-fills the email
+claude-rotate login --email you@example.com # passed on to claude auth login
 ```
 
 It logs in inside a throwaway config dir, enrolls the account and deletes the dir. No live session sees that login.
@@ -293,7 +299,7 @@ It logs in inside a throwaway config dir, enrolls the account and deletes the di
 
 `enroll` reads the config dir from `$CLAUDE_CONFIG_DIR` (default `~/.claude`), or from `--config-dir`. The config dir is now on that account, the same state a rotation leaves it in. The account you are already logged into in `~/.claude` can be enrolled the same way, with `claude-rotate enroll`.
 
-**Never enroll from a config dir that claude-rotate doesn't watch while sessions run in it.** The watcher only knows which accounts are live from the watched config dirs. To it, that account looks idle, so every 6 hours it renews the account in a throwaway dir. The renewal rotates the refresh token, which revokes the copy the unwatched dir holds, and those sessions are logged out.
+**Never enroll from a config dir that claude-rotate doesn't watch while sessions run in it.** The watcher only knows which accounts are live from the watched config dirs. To it, that account looks idle, so it renews the account in a throwaway dir: on its first tick, then every 6 hours. The renewal rotates the refresh token, which revokes the copy the unwatched dir holds, and those sessions are logged out.
 
 **Never enroll the same login twice.** Two slots holding the same refresh-token family revoke each other the first time either refreshes. Always enroll from a fresh login.
 
@@ -313,7 +319,7 @@ The first command creates `~/.config/claude-rotate/config.json` (or under `$XDG_
 
 Each config dir switches independently. To keep accounts apart, use separate config dirs and list each one.
 
-The watcher reads `config.json` on every tick, so edits take effect without a restart. A newly added config dir starts from its current transcripts.
+The watcher reads `config.json` on every tick, so a saved edit takes effect without a restart. Edit it while the watcher is stopped anyway: a half-saved file makes the watcher crash, and a concurrent `enroll` can overwrite your edit. A newly added config dir starts from its current transcripts.
 
 ### 5. Turn on Remote Control reconnects (optional)
 
@@ -398,7 +404,7 @@ Stale-bridge disconnects and compactions also need a free session (`idle` or `sh
 
 **A session was never compacted or continued.** With Remote Control on, wake and compact wait for the session's new bridge. If the bridge never comes back, they never run. Get the bridge back (see above) or type the commands yourself. Pending compactions are also lost when the watcher restarts.
 
-**`renew_error`.** The renewal failed for a reason other than a rejected login: timeout (180 seconds), network, or `claude` not found on the service's `PATH`. It is retried at the next due time. Run `claude-rotate check` to retry now and see the result per account.
+**`renew_error`.** The renewal failed for a reason other than a rejected login: timeout (180 seconds), network, or `claude` not found on the service's `PATH`. It is retried on every tick until it works, so the line repeats. Run `claude-rotate check` to see the result per account.
 
 **`owner_unresolved` or `owner_not_enrolled`.** The live token's owner couldn't be checked (no network) or belongs to an account not in the vault. Nothing is written. Enroll the account if it should rotate.
 
@@ -418,7 +424,7 @@ Stale-bridge disconnects and compactions also need a free session (`idle` or `sh
 | `claude-rotate enroll [--config-dir DIR]` | Snapshot the account logged in to `DIR` (default `$CLAUDE_CONFIG_DIR` or `~/.claude`) into the vault, after checking the token's owner |
 | `claude-rotate status` | Account per watched config dir; for every account: available / limited until / dead, and token expiry. Never prints tokens |
 | `claude-rotate check` | Renew every idle account now, including limited and dead ones; exit code 1 if any fails |
-| `claude-rotate use EMAIL [--config-dir DIR]` | Switch a config dir to an account by hand. It only switches; it doesn't wake or compact sessions |
+| `claude-rotate use EMAIL [--config-dir DIR]` | Switch a config dir to an account by hand. While the watcher runs, sessions stopped by a limit are woken; other active sessions are not compacted |
 | `claude-rotate watch [--interval SECONDS]` | The watch loop (default 15 seconds; 5 seconds while a post-switch guard is active) |
 
 ### Configuration and state files
