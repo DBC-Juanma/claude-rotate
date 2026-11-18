@@ -1068,7 +1068,8 @@ class Rotator:
         """Run /compact in each session of cd that was active at the last switch, once its prompt is free.
 
         A session waits while it is busy, while its new Remote Control bridge is not up yet (so the compaction is the
-        first thing the remote session shows), and while its input box holds a draft or a dialog. Returns the panes.
+        first thing the remote session shows), and while its input box holds a draft or a dialog. resume tells it to
+        continue once the compaction is in its transcript. Returns the panes.
         """
         ctx, asked = self.ctx, []
         due = self.compact_due.get(cd)
@@ -1076,24 +1077,27 @@ class Rotator:
             return asked
         alive = {p.pid: p for p in ctx.list_procs() if os.path.normpath(p.config_dir) == os.path.normpath(cd) and p.pane}
         due &= set(alive)
+        pending = self.continue_due.setdefault(cd, {})
         for pid in sorted(due):
             p, info = alive[pid], session_info(cd, pid)
-            if info.get("kind") != "interactive" or info.get("status") not in PROMPT_FREE or not self.rc_ready(cd, pid, info):
+            if pid in pending or info.get("kind") != "interactive" or info.get("status") not in PROMPT_FREE or not self.rc_ready(cd, pid, info):
                 continue
             path = session_transcript(cd, pid)
             line = last_turn_entry(path) if path else None
             hit = entry_error(line) if line else None
-            if hit and hit.kind == "limit" or not prompt_empty(ctx.tmux_capture(p)):
+            if not path or hit and hit.kind == "limit" or not prompt_empty(ctx.tmux_capture(p)):
                 continue
+            offset = os.path.getsize(path)
             self.type_line(p, COMPACT_TEXT)
             due.discard(pid)
+            pending[pid] = (path, offset, ctx.now())
             asked.append(p.pane)
         if asked:
             ctx.log("compact_asked", config_dir=cd, panes=",".join(asked))
         return asked
 
     def resume(self, cd: str) -> list:
-        """Tell each session wake compacted to continue, once its transcript holds the compaction and its prompt is free.
+        """Tell each session wake or compact compacted to continue, once its transcript holds the compaction and its prompt is free.
 
         A compaction that has not shown up COMPACT_WAIT seconds after /compact was typed is logged and the session is
         told to continue anyway, so a failed /compact does not leave it stopped. Returns the panes told.
