@@ -31,8 +31,10 @@ PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 LIMIT_ERROR = "usage_limit_reached"
 AUTH_ERROR = "authentication_failed"
 COMPACT_TEXT = ("/compact Account rotated (claude-rotate). Keep what this session was doing, what is done, what is pending "
-                "and the next step.")
-CONTINUE_TEXT = "Account rotated (claude-rotate) and the conversation compacted. Continue where you stopped."
+                "and the next step, and the local file and URL of every artifact this session published.")
+CONTINUE_TEXT = ("Account rotated (claude-rotate) and the conversation compacted. First republish every artifact this "
+                 "session published, from its local file, so it lives on the current account, and give me the new links. "
+                 "Then continue where you stopped.")
 ACTIVE_WINDOW = 30 * 60
 COMPACT_WAIT = 10 * 60
 COMPACT_MARK = b'"compact_boundary"'
